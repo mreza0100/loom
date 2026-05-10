@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "loom": {
+      "command": "uv",
+      "args": ["run", "--directory", "/Users/reza/work/loom", "python", "-m", "loom", "/Users/reza/work/loom/sample"],
+      "cwd": "/Users/reza/work/loom"
+    }
+  }
+}

@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.venv/
+.eggs/
+
+# Loom
+.loom.db
+.loom.db-*
+
+# Environment
+.env
+.env.local
+.env.test
+.env.ports
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Dev
+tmp/
+*.log
+
+# Worktrees
+.worktrees/
+
+# uv
+.python-version
