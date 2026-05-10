@@ -2,6 +2,7 @@
 
 import pytest
 
+from loom.config import LoomConfig
 from loom.store.db import LoomDB, _sanitize_fts_query, _serialize_vec
 from loom.store.models import Edge, Symbol
 
@@ -94,16 +95,12 @@ class TestLoomDBConnection:
         assert "index_meta" in table_names
         assert "vec_symbols" in table_names
 
-    def test_conn_raises_when_not_connected(self, config: "LoomConfig") -> None:
-        from loom.config import LoomConfig
-
+    def test_conn_raises_when_not_connected(self, config: LoomConfig) -> None:
         loom_db = LoomDB(config)
         with pytest.raises(RuntimeError, match="not connected"):
             _ = loom_db.conn
 
-    def test_close_and_reconnect(self, config: "LoomConfig") -> None:
-        from loom.config import LoomConfig
-
+    def test_close_and_reconnect(self, config: LoomConfig) -> None:
         loom_db = LoomDB(config)
         loom_db.connect()
         loom_db.close()
@@ -116,6 +113,10 @@ class TestLoomDBConnection:
     def test_close_idempotent(self, db: LoomDB) -> None:
         db.close()
         db.close()
+
+    def test_foreign_keys_enabled(self, db: LoomDB) -> None:
+        result = db.conn.execute("PRAGMA foreign_keys").fetchone()
+        assert result[0] == 1
 
 
 class TestSymbolCRUD:
@@ -151,7 +152,7 @@ class TestSymbolCRUD:
                 line=1,
                 end_line=5,
                 language="javascript",
-            )
+            ),
         )
         db.insert_symbol(
             Symbol(
@@ -161,7 +162,7 @@ class TestSymbolCRUD:
                 line=1,
                 end_line=5,
                 language="javascript",
-            )
+            ),
         )
         db.commit()
 
@@ -186,7 +187,7 @@ class TestSymbolFuzzyLookup:
                 line=1,
                 end_line=5,
                 language="javascript",
-            )
+            ),
         )
         db.commit()
         results = db.get_symbol_by_name_fuzzy("compile")
@@ -202,7 +203,7 @@ class TestSymbolFuzzyLookup:
                 line=100,
                 end_line=150,
                 language="javascript",
-            )
+            ),
         )
         db.commit()
         results = db.get_symbol_by_name_fuzzy("compile")
@@ -218,7 +219,7 @@ class TestSymbolFuzzyLookup:
                 line=100,
                 end_line=150,
                 language="javascript",
-            )
+            ),
         )
         db.insert_symbol(
             Symbol(
@@ -228,7 +229,7 @@ class TestSymbolFuzzyLookup:
                 line=10,
                 end_line=20,
                 language="javascript",
-            )
+            ),
         )
         db.commit()
         results = db.get_symbol_by_name_fuzzy("compile", file="Compiler.js")
@@ -244,7 +245,7 @@ class TestSymbolFuzzyLookup:
                 line=1,
                 end_line=10,
                 language="javascript",
-            )
+            ),
         )
         db.commit()
         results = db.get_symbol_by_name_fuzzy("makePathsRelative")
@@ -260,7 +261,7 @@ class TestSymbolFuzzyLookup:
                 line=1,
                 end_line=5,
                 language="javascript",
-            )
+            ),
         )
         db.commit()
         results = db.get_symbol_by_name_fuzzy("_publicFunc")
@@ -276,7 +277,7 @@ class TestSymbolFuzzyLookup:
                 line=1,
                 end_line=5,
                 language="javascript",
-            )
+            ),
         )
         db.commit()
         results = db.get_symbol_by_name_fuzzy("helper", file="helper.js")
@@ -295,7 +296,7 @@ class TestSymbolFuzzyLookup:
                 line=1,
                 end_line=5,
                 language="javascript",
-            )
+            ),
         )
         db.commit()
         results = db.get_symbol_by_name_fuzzy("compile")
@@ -310,7 +311,7 @@ class TestSymbolFuzzyLookup:
                 line=1,
                 end_line=5,
                 language="javascript",
-            )
+            ),
         )
         db.insert_symbol(
             Symbol(
@@ -320,7 +321,7 @@ class TestSymbolFuzzyLookup:
                 line=10,
                 end_line=15,
                 language="javascript",
-            )
+            ),
         )
         db.insert_symbol(
             Symbol(
@@ -330,7 +331,7 @@ class TestSymbolFuzzyLookup:
                 line=1,
                 end_line=5,
                 language="javascript",
-            )
+            ),
         )
         db.commit()
 
@@ -344,81 +345,177 @@ class TestSymbolFuzzyLookup:
 
 
 class TestEdgeCRUD:
-    def test_insert_and_query_from(self, db: LoomDB, sample_edge: Edge) -> None:
-        db.insert_edge(sample_edge)
+    def _make_sym(self, db: LoomDB, name: str, file: str = "a.js") -> int:
+        return db.insert_symbol(
+            Symbol(
+                name=name, kind="function", file=file, line=1, end_line=5, language="javascript"
+            ),
+        )
+
+    def test_insert_and_query_from(self, db: LoomDB) -> None:
+        src_id = self._make_sym(db, "processOrder", "order.js")
+        tgt_id = self._make_sym(db, "validateCart", "validation.js")
+        db.insert_edge(
+            Edge(
+                source_id=src_id,
+                target_name="validateCart",
+                target_id=tgt_id,
+                relationship="calls",
+                confidence=1.0,
+            ),
+        )
         db.commit()
 
-        edges = db.get_edges_from("processOrder")
+        edges = db.get_edges_from(src_id)
         assert len(edges) == 1
         assert edges[0].target_name == "validateCart"
         assert edges[0].relationship == "calls"
+        assert edges[0].target_id == tgt_id
 
-    def test_get_edges_from_with_file(self, db: LoomDB) -> None:
+    def test_get_edges_from_empty(self, db: LoomDB) -> None:
+        src_id = self._make_sym(db, "lonely")
+        db.commit()
+        assert db.get_edges_from(src_id) == []
+
+    def test_get_edges_to(self, db: LoomDB) -> None:
+        src_id = self._make_sym(db, "processOrder", "order.js")
+        tgt_id = self._make_sym(db, "validateCart", "validation.js")
         db.insert_edge(
             Edge(
-                source_name="func",
-                source_file="a.js",
-                target_name="helper",
-                target_file=None,
-                relationship="calls",
-            )
-        )
-        db.insert_edge(
-            Edge(
-                source_name="func",
-                source_file="b.js",
-                target_name="other",
-                target_file=None,
-                relationship="calls",
-            )
+                source_id=src_id, target_name="validateCart", target_id=tgt_id, relationship="calls"
+            ),
         )
         db.commit()
 
-        all_edges = db.get_edges_from("func")
-        assert len(all_edges) == 2
-
-        filtered = db.get_edges_from("func", file="a.js")
-        assert len(filtered) == 1
-        assert filtered[0].target_name == "helper"
-
-    def test_get_edges_to(self, db: LoomDB, sample_edge: Edge) -> None:
-        db.insert_edge(sample_edge)
-        db.commit()
-
-        edges = db.get_edges_to("validateCart")
+        edges = db.get_edges_to(tgt_id)
         assert len(edges) == 1
-        assert edges[0].source_name == "processOrder"
-
-    def test_get_edges_to_with_file(self, db: LoomDB) -> None:
-        db.insert_edge(
-            Edge(
-                source_name="caller1",
-                source_file="a.js",
-                target_name="target",
-                target_file="t.js",
-                relationship="calls",
-            )
-        )
-        db.insert_edge(
-            Edge(
-                source_name="caller2",
-                source_file="b.js",
-                target_name="target",
-                target_file=None,
-                relationship="calls",
-            )
-        )
-        db.commit()
-
-        with_file = db.get_edges_to("target", file="t.js")
-        assert len(with_file) == 1  # only explicit file match, not NULL
-
-        without_file = db.get_edges_to("target")
-        assert len(without_file) == 2
+        assert edges[0].source_id == src_id
 
     def test_no_edges(self, db: LoomDB) -> None:
-        assert db.get_edges_from("nonexistent") == []
-        assert db.get_edges_to("nonexistent") == []
+        sym_id = self._make_sym(db, "nonexistent")
+        db.commit()
+        assert db.get_edges_from(sym_id) == []
+        assert db.get_edges_to(sym_id) == []
+
+    def test_insert_returns_edge_id(self, db: LoomDB) -> None:
+        src_id = self._make_sym(db, "src")
+        edge_id = db.insert_edge(
+            Edge(source_id=src_id, target_name="foo", relationship="calls"),
+        )
+        assert edge_id > 0
+
+    def test_get_unresolved_edges(self, db: LoomDB) -> None:
+        src_id = self._make_sym(db, "caller")
+        db.insert_edge(Edge(source_id=src_id, target_name="unknownTarget", relationship="calls"))
+        db.commit()
+
+        unresolved = db.get_unresolved_edges()
+        assert len(unresolved) >= 1
+        assert any(e.target_name == "unknownTarget" for e in unresolved)
+        assert all(e.target_id is None for e in unresolved)
+
+    def test_update_edge_target(self, db: LoomDB) -> None:
+        src_id = self._make_sym(db, "caller")
+        tgt_id = self._make_sym(db, "callee")
+        edge_id = db.insert_edge(
+            Edge(source_id=src_id, target_name="callee", relationship="calls"),
+        )
+        db.commit()
+
+        db.update_edge_target(edge_id, tgt_id, 0.95)
+        db.commit()
+
+        edges = db.get_edges_from(src_id)
+        assert len(edges) == 1
+        assert edges[0].target_id == tgt_id
+        assert edges[0].confidence == pytest.approx(0.95)
+
+    def test_get_edges_to_by_name(self, db: LoomDB) -> None:
+        src_id = self._make_sym(db, "caller")
+        db.insert_edge(Edge(source_id=src_id, target_name="fooBar", relationship="calls"))
+        db.commit()
+
+        results = db.get_edges_to_by_name("fooBar")
+        assert len(results) == 1
+        assert results[0].target_name == "fooBar"
+
+    def test_edge_confidence_roundtrip(self, db: LoomDB) -> None:
+        src_id = self._make_sym(db, "src")
+        tgt_id = self._make_sym(db, "tgt")
+        db.insert_edge(
+            Edge(
+                source_id=src_id,
+                target_name="tgt",
+                target_id=tgt_id,
+                relationship="calls",
+                confidence=0.85,
+            ),
+        )
+        db.commit()
+
+        edges = db.get_edges_from(src_id)
+        assert len(edges) == 1
+        assert edges[0].confidence == pytest.approx(0.85)
+
+    def test_remove_file_nullifies_target_edges(self, db: LoomDB) -> None:
+        """Removing a file should nullify edges pointing TO its symbols, not delete them."""
+        # File A has a symbol that other files point to
+        tgt_id = db.insert_symbol(
+            Symbol(
+                name="targetFunc",
+                kind="function",
+                file="a.js",
+                line=1,
+                end_line=5,
+                language="javascript",
+            ),
+        )
+        # File B has a caller pointing to targetFunc in a.js
+        src_id = db.insert_symbol(
+            Symbol(
+                name="caller",
+                kind="function",
+                file="b.js",
+                line=1,
+                end_line=5,
+                language="javascript",
+            ),
+        )
+        edge_id = db.insert_edge(
+            Edge(
+                source_id=src_id,
+                target_name="targetFunc",
+                target_id=tgt_id,
+                relationship="calls",
+                confidence=1.0,
+            ),
+        )
+        db.commit()
+
+        # Remove file A
+        db.remove_file("a.js")
+        db.commit()
+
+        # Edge from b.js should still exist but with target_id=NULL
+        unresolved = db.get_unresolved_edges()
+        unresolved_ids = [e.id for e in unresolved]
+        assert edge_id in unresolved_ids
+
+        # targetFunc symbol should be gone
+        assert db.get_symbol_by_name("targetFunc") == []
+
+    def test_remove_edges_for_source(self, db: LoomDB) -> None:
+        src_id = self._make_sym(db, "src")
+        tgt_id = self._make_sym(db, "tgt")
+        db.insert_edge(
+            Edge(source_id=src_id, target_name="tgt", target_id=tgt_id, relationship="calls"),
+        )
+        db.commit()
+
+        db.remove_edges_for_source(src_id)
+        db.commit()
+
+        assert db.get_edges_from(src_id) == []
 
 
 class TestEmbedding:
@@ -447,7 +544,7 @@ class TestEmbedding:
                     line=i,
                     end_line=i + 1,
                     language="javascript",
-                )
+                ),
             )
             db.insert_embedding(sym_id, [float(i) / 10] * 768)
         db.commit()
@@ -467,7 +564,7 @@ class TestFTS:
                 end_line=10,
                 language="javascript",
                 context="function processOrder(cart) { }",
-            )
+            ),
         )
         db.commit()
 
@@ -485,7 +582,7 @@ class TestFTS:
                 end_line=5,
                 language="javascript",
                 context="function helper() { validate the cart items }",
-            )
+            ),
         )
         db.commit()
 
@@ -508,7 +605,7 @@ class TestFTS:
                 line=1,
                 end_line=5,
                 language="javascript",
-            )
+            ),
         )
         db.commit()
         results = db.search_fts("my-func AND something")
@@ -525,7 +622,7 @@ class TestFTS:
                     end_line=i + 1,
                     language="javascript",
                     context=f"function func{i}() {{ common code }}",
-                )
+                ),
             )
         db.commit()
 
@@ -552,7 +649,10 @@ class TestFileState:
 
 class TestRemoveFile:
     def test_remove_file_cleans_everything(self, db: LoomDB) -> None:
-        sym_id = db.insert_symbol(
+        """Removing a file deletes its symbols (CASCADE removes its outgoing edges)
+        and nullifies incoming edges (target_id -> NULL)."""
+        # File A: has a symbol and a source edge (to b.js)
+        src_id = db.insert_symbol(
             Symbol(
                 name="doStuff",
                 kind="function",
@@ -560,26 +660,52 @@ class TestRemoveFile:
                 line=1,
                 end_line=5,
                 language="javascript",
-            )
+            ),
         )
-        db.insert_embedding(sym_id, [0.1] * 768)
-        db.insert_edge(
+        db.insert_embedding(src_id, [0.1] * 768)
+
+        # File B: has a symbol that remove_me.js points to
+        tgt_id = db.insert_symbol(
+            Symbol(
+                name="helper",
+                kind="function",
+                file="other.js",
+                line=1,
+                end_line=5,
+                language="javascript",
+            ),
+        )
+
+        # Edge from doStuff -> helper (should be CASCADE deleted when remove_me.js is removed)
+        outgoing_edge_id = db.insert_edge(
             Edge(
-                source_name="doStuff",
-                source_file="remove_me.js",
+                source_id=src_id,
                 target_name="helper",
-                target_file="other.js",
+                target_id=tgt_id,
                 relationship="calls",
-            )
+                confidence=1.0,
+            ),
         )
-        db.insert_edge(
+
+        # File B also has a caller -> doStuff (this edge should become unresolved)
+        caller_id = db.insert_symbol(
+            Symbol(
+                name="caller",
+                kind="function",
+                file="other.js",
+                line=10,
+                end_line=15,
+                language="javascript",
+            ),
+        )
+        incoming_edge_id = db.insert_edge(
             Edge(
-                source_name="caller",
-                source_file="other.js",
+                source_id=caller_id,
                 target_name="doStuff",
-                target_file="remove_me.js",
+                target_id=src_id,
                 relationship="calls",
-            )
+                confidence=1.0,
+            ),
         )
         db.set_file_hash("remove_me.js", "hash1")
         db.commit()
@@ -587,10 +713,26 @@ class TestRemoveFile:
         db.remove_file("remove_me.js")
         db.commit()
 
+        # doStuff symbol should be gone
         assert db.get_symbol_by_name("doStuff") == []
+        # File hash should be gone
         assert db.get_file_hash("remove_me.js") is None
-        assert db.get_edges_from("doStuff", file="remove_me.js") == []
+        # Vector for doStuff should be gone
         assert db.search_vec([0.1] * 768, limit=5) == []
+
+        # Outgoing edge (doStuff -> helper) should be CASCADE deleted
+        outgoing = db.conn.execute(
+            "SELECT id FROM edges WHERE id = ?", (outgoing_edge_id,)
+        ).fetchone()
+        assert outgoing is None
+
+        # Incoming edge (caller -> doStuff) should now be unresolved (target_id=NULL)
+        incoming_row = db.conn.execute(
+            "SELECT id, target_id FROM edges WHERE id = ?",
+            (incoming_edge_id,),
+        ).fetchone()
+        assert incoming_row is not None
+        assert incoming_row[1] is None  # target_id nullified
 
     def test_remove_nonexistent_file(self, db: LoomDB) -> None:
         db.remove_file("nonexistent.js")

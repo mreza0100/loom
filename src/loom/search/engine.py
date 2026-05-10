@@ -71,7 +71,7 @@ _GENERIC_CALL_TARGETS = frozenset(
         "callback",
         "next",
         "done",
-    }
+    },
 )
 
 MAX_STRUCTURAL_RESULTS = 30
@@ -117,7 +117,9 @@ class SearchEngine:
         symbol_map: dict[int, Symbol] = {}
 
         for rank, sym in enumerate(fts_results):
-            assert sym.id is not None
+            if sym.id is None:
+                log.warning("FTS result has None id, skipping: %s", sym.name)
+                continue
             boost = KIND_BOOST.get(sym.kind, 1.0)
             scores[sym.id] = scores.get(sym.id, 0) + _rrf_score(rank) * boost
             symbol_map[sym.id] = sym
@@ -125,11 +127,11 @@ class SearchEngine:
         for rank, (sym_id, _distance) in enumerate(vec_results):
             scores[sym_id] = scores.get(sym_id, 0) + _rrf_score(rank)
             if sym_id not in symbol_map:
-                sym = self._db.get_symbol_by_id(sym_id)
-                if sym:
-                    boost = KIND_BOOST.get(sym.kind, 1.0)
+                vec_sym = self._db.get_symbol_by_id(sym_id)
+                if vec_sym:
+                    boost = KIND_BOOST.get(vec_sym.kind, 1.0)
                     scores[sym_id] = scores.get(sym_id, 0) + _rrf_score(rank) * (boost - 1.0)
-                    symbol_map[sym_id] = sym
+                    symbol_map[sym_id] = vec_sym
 
         if kind:
             scores = {
@@ -143,11 +145,11 @@ class SearchEngine:
 
         results: list[SearchResult] = []
         for sym_id, score in ranked:
-            sym = symbol_map.get(sym_id)
-            if not sym:
+            result_sym = symbol_map.get(sym_id)
+            if not result_sym:
                 continue
-            coupled = self._find_coupled(sym)
-            results.append(SearchResult(symbol=sym, score=score, coupled=coupled))
+            coupled = self._find_coupled(result_sym)
+            results.append(SearchResult(symbol=result_sym, score=score, coupled=coupled))
 
         return results
 
@@ -183,22 +185,52 @@ class SearchEngine:
         dependents: list[CoupledSymbol] = []
         seen: set[int | None] = {target.id}
 
-        incoming = self._db.get_edges_to(target.name, target.file)
-        for edge in incoming:
-            if edge.source_name in _GENERIC_CALL_TARGETS:
-                continue
-            callers = self._db.get_symbol_by_name(edge.source_name, edge.source_file)
-            for caller in callers:
-                if caller.id in seen:
+        # Resolved incoming edges: use ID-based lookup
+        if target.id is not None:
+            resolved_incoming = self._db.get_edges_to(target.id)
+            for edge in resolved_incoming:
+                source_sym = self._db.get_symbol_by_id(edge.source_id)
+                if source_sym is None:
                     continue
-                seen.add(caller.id)
+                # Filter generic source names
+                if source_sym.name.split(".")[-1] in _GENERIC_CALL_TARGETS:
+                    continue
+                if source_sym.id in seen:
+                    continue
+                seen.add(source_sym.id)
                 dependents.append(
                     CoupledSymbol(
-                        symbol=caller,
+                        symbol=source_sym,
                         score=0.8,
                         reason=f"{edge.relationship} (structural)",
-                    )
+                    ),
                 )
+
+        # Unresolved incoming edges: find by target_name match
+        # These are callers that haven't been Phase-2-resolved yet
+        unresolved_by_name = self._db.get_edges_to_by_name(target.name)
+        for edge in unresolved_by_name:
+            # Skip if resolved to a different symbol (false positive by name)
+            if edge.target_id is not None and edge.target_id != target.id:
+                continue
+            # Skip already-resolved edges (already handled above)
+            if edge.target_id == target.id:
+                continue
+            source_sym = self._db.get_symbol_by_id(edge.source_id)
+            if source_sym is None:
+                continue
+            if source_sym.name.split(".")[-1] in _GENERIC_CALL_TARGETS:
+                continue
+            if source_sym.id in seen:
+                continue
+            seen.add(source_sym.id)
+            dependents.append(
+                CoupledSymbol(
+                    symbol=source_sym,
+                    score=0.8,
+                    reason=f"{edge.relationship} (structural)",
+                ),
+            )
 
         if target.id is not None:
             sym_text = self._embedder.build_symbol_text(target.name, target.kind, target.context)
@@ -217,7 +249,7 @@ class SearchEngine:
                                 symbol=sym,
                                 score=sim,
                                 reason="semantically similar",
-                            )
+                            ),
                         )
 
         if kind:
@@ -256,48 +288,58 @@ class SearchEngine:
         return anchor, coupled
 
     def _find_coupled(self, target: Symbol) -> list[CoupledSymbol]:
+        """Find all symbols structurally/semantically coupled to target.
+
+        Uses ID-based edge traversal. Unresolved edges (target_id=None) are skipped
+        for outgoing traversal — only resolved edges are followed.
+        """
         coupled: list[CoupledSymbol] = []
         seen: set[int | None] = {target.id}
 
-        outgoing = self._db.get_edges_from(target.name, target.file)
-        for edge in outgoing:
-            if edge.target_name in _GENERIC_CALL_TARGETS:
-                continue
-            if edge.target_file:
-                targets = self._db.get_symbol_by_name(edge.target_name, edge.target_file)
-            else:
-                targets = self._db.get_symbol_by_name(edge.target_name)
-            for sym in targets:
-                if sym.id not in seen:
+        if target.id is not None:
+            # Outgoing edges: only follow resolved ones (target_id is not None)
+            outgoing = self._db.get_edges_from(target.id)
+            for edge in outgoing:
+                # Phase 3 compat: check last segment of dotted expression against filter
+                if edge.target_name.split(".")[-1] in _GENERIC_CALL_TARGETS:
+                    continue
+                if edge.target_id is None:
+                    continue  # unresolved — skip
+                sym = self._db.get_symbol_by_id(edge.target_id)
+                if sym and sym.id not in seen:
                     seen.add(sym.id)
                     coupled.append(
                         CoupledSymbol(
                             symbol=sym,
                             score=0.7,
                             reason=f"{edge.relationship} (structural)",
-                        )
+                        ),
                     )
-            if len(coupled) >= MAX_STRUCTURAL_RESULTS:
-                break
+                if len(coupled) >= MAX_STRUCTURAL_RESULTS:
+                    break
 
-        incoming = self._db.get_edges_to(target.name, target.file)
-        for edge in incoming:
-            if edge.source_name in _GENERIC_CALL_TARGETS:
-                continue
-            callers = self._db.get_symbol_by_name(edge.source_name, edge.source_file)
-            for sym in callers:
-                if sym.id not in seen:
-                    seen.add(sym.id)
+            # Incoming edges: source is always resolved (source_id always set)
+            incoming = self._db.get_edges_to(target.id)
+            for edge in incoming:
+                source_sym = self._db.get_symbol_by_id(edge.source_id)
+                if source_sym is None:
+                    continue
+                # Filter generic source names
+                if source_sym.name.split(".")[-1] in _GENERIC_CALL_TARGETS:
+                    continue
+                if source_sym.id not in seen:
+                    seen.add(source_sym.id)
                     coupled.append(
                         CoupledSymbol(
-                            symbol=sym,
+                            symbol=source_sym,
                             score=0.6,
                             reason="called_by (structural)",
-                        )
+                        ),
                     )
-            if len(coupled) >= MAX_STRUCTURAL_RESULTS:
-                break
+                if len(coupled) >= MAX_STRUCTURAL_RESULTS:
+                    break
 
+        # Semantic coupling via vector search
         if target.id is not None:
             sym_text = self._embedder.build_symbol_text(target.name, target.kind, target.context)
             embedding = self._embedder.embed_single(sym_text)
@@ -315,7 +357,7 @@ class SearchEngine:
                                 symbol=sym,
                                 score=sim,
                                 reason="semantically similar",
-                            )
+                            ),
                         )
 
         coupled.sort(key=lambda c: c.score, reverse=True)

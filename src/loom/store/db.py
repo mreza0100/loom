@@ -26,17 +26,23 @@ CREATE TABLE IF NOT EXISTS symbols (
 CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
 CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file);
 
-CREATE TABLE IF NOT EXISTS edges (
+DROP TABLE IF EXISTS edges;
+
+CREATE TABLE edges (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    source_name TEXT NOT NULL,
-    source_file TEXT NOT NULL,
+    source_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+    target_id INTEGER REFERENCES symbols(id) ON DELETE SET NULL,
     target_name TEXT NOT NULL,
     target_file TEXT,
-    relationship TEXT NOT NULL
+    relationship TEXT NOT NULL,
+    confidence REAL NOT NULL DEFAULT 0.0,
+    original_name TEXT
 );
 
-CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_name, source_file);
-CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_name);
+CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id);
+CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
+CREATE INDEX IF NOT EXISTS idx_edges_target_name ON edges(target_name);
+CREATE INDEX IF NOT EXISTS idx_edges_unresolved ON edges(target_id) WHERE target_id IS NULL;
 
 CREATE TABLE IF NOT EXISTS index_meta (
     file_path TEXT PRIMARY KEY,
@@ -86,7 +92,10 @@ class LoomDB:
         self._conn.enable_load_extension(True)
         sqlite_vec.load(self._conn)
         self._conn.enable_load_extension(False)
+        # Foreign key enforcement must be enabled per connection — NOT inside executescript
         self._conn.executescript(SCHEMA)
+        # Re-apply after executescript (which issues an implicit COMMIT and may reset state)
+        self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.execute(
             VEC_SCHEMA.format(dims=self._config.embedding_dimensions),
         )
@@ -120,6 +129,14 @@ class LoomDB:
         )
 
     def remove_file(self, path: str) -> None:
+        # Step 1: Nullify edges that point TO this file's symbols (convert to unresolved).
+        # Must happen BEFORE deleting symbols so we can find them by file.
+        self.conn.execute(
+            "UPDATE edges SET target_id = NULL, confidence = 0.0 "
+            "WHERE target_id IN (SELECT id FROM symbols WHERE file = ?)",
+            (path,),
+        )
+        # Step 2: Delete vectors and FTS entries for this file's symbols
         symbol_ids = [
             row[0]
             for row in self.conn.execute(
@@ -137,11 +154,8 @@ class LoomDB:
                 f"DELETE FROM symbols_fts WHERE rowid IN ({placeholders})",  # noqa: S608
                 symbol_ids,
             )
+        # Step 3: Delete symbols — ON DELETE CASCADE removes edges FROM this file's symbols
         self.conn.execute("DELETE FROM symbols WHERE file = ?", (path,))
-        self.conn.execute(
-            "DELETE FROM edges WHERE source_file = ? OR target_file = ?",
-            (path, path),
-        )
         self.conn.execute("DELETE FROM index_meta WHERE file_path = ?", (path,))
 
     # --- Symbols ---
@@ -161,7 +175,8 @@ class LoomDB:
             ),
         )
         symbol_id = cursor.lastrowid
-        assert symbol_id is not None
+        if symbol_id is None:
+            raise RuntimeError("insert_symbol: lastrowid is None — DB returned no rowid")
         self.conn.execute(
             "INSERT INTO symbols_fts (rowid, name, kind, file, context) VALUES (?, ?, ?, ?, ?)",
             (symbol_id, symbol.name, symbol.kind, symbol.file, symbol.context),
@@ -174,18 +189,77 @@ class LoomDB:
             (symbol_id, _serialize_vec(embedding)),
         )
 
-    def insert_edge(self, edge: Edge) -> None:
-        self.conn.execute(
-            "INSERT INTO edges (source_name, source_file, target_name, target_file, relationship) "
-            "VALUES (?, ?, ?, ?, ?)",
+    def insert_edge(self, edge: Edge) -> int:
+        cursor = self.conn.execute(
+            "INSERT INTO edges "
+            "(source_id, target_id, target_name, target_file, relationship, confidence, "
+            "original_name) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
-                edge.source_name,
-                edge.source_file,
+                edge.source_id,
+                edge.target_id,
                 edge.target_name,
                 edge.target_file,
                 edge.relationship,
+                edge.confidence,
+                edge.original_name,
             ),
         )
+        row_id = cursor.lastrowid
+        if row_id is None:
+            raise RuntimeError("insert_edge: lastrowid is None — DB returned no rowid")
+        return row_id
+
+    # --- Edge queries ---
+
+    def get_edges_from(self, symbol_id: int) -> list[Edge]:
+        rows = self.conn.execute(
+            "SELECT id, source_id, target_id, target_name, target_file, relationship, confidence, "
+            "original_name FROM edges WHERE source_id = ?",
+            (symbol_id,),
+        ).fetchall()
+        return [self._row_to_edge(r) for r in rows]
+
+    def get_edges_to(self, symbol_id: int) -> list[Edge]:
+        rows = self.conn.execute(
+            "SELECT id, source_id, target_id, target_name, target_file, relationship, confidence, "
+            "original_name FROM edges WHERE target_id = ?",
+            (symbol_id,),
+        ).fetchall()
+        return [self._row_to_edge(r) for r in rows]
+
+    def get_edges_to_by_name(self, target_name: str) -> list[Edge]:
+        """Return all edges (resolved and unresolved) where target_name matches.
+
+        Used by impact() to find unresolved callers whose target_id IS NULL but
+        target_name matches the queried symbol. Also returns resolved edges with the
+        same name — caller must filter out any where target_id != symbol.id.
+        """
+        rows = self.conn.execute(
+            "SELECT id, source_id, target_id, target_name, target_file, relationship, confidence, "
+            "original_name FROM edges WHERE target_name = ?",
+            (target_name,),
+        ).fetchall()
+        return [self._row_to_edge(r) for r in rows]
+
+    def get_unresolved_edges(self) -> list[Edge]:
+        """Return all edges with target_id IS NULL (pending Phase 2 resolution)."""
+        rows = self.conn.execute(
+            "SELECT id, source_id, target_id, target_name, target_file, relationship, confidence, "
+            "original_name FROM edges WHERE target_id IS NULL",
+        ).fetchall()
+        return [self._row_to_edge(r) for r in rows]
+
+    def update_edge_target(self, edge_id: int, target_id: int, confidence: float) -> None:
+        """Resolve a previously-unresolved edge (Phase 2 resolution)."""
+        self.conn.execute(
+            "UPDATE edges SET target_id = ?, confidence = ? WHERE id = ?",
+            (target_id, confidence, edge_id),
+        )
+
+    def remove_edges_for_source(self, symbol_id: int) -> None:
+        """Delete all edges where source_id matches. Used when re-indexing a file."""
+        self.conn.execute("DELETE FROM edges WHERE source_id = ?", (symbol_id,))
 
     # --- Queries ---
 
@@ -288,36 +362,6 @@ class LoomDB:
 
         return []
 
-    def get_edges_from(self, name: str, file: str | None = None) -> list[Edge]:
-        if file:
-            rows = self.conn.execute(
-                "SELECT source_name, source_file, target_name, target_file, relationship "
-                "FROM edges WHERE source_name = ? AND source_file = ?",
-                (name, file),
-            ).fetchall()
-        else:
-            rows = self.conn.execute(
-                "SELECT source_name, source_file, target_name, target_file, relationship "
-                "FROM edges WHERE source_name = ?",
-                (name,),
-            ).fetchall()
-        return [Edge(*r) for r in rows]
-
-    def get_edges_to(self, name: str, file: str | None = None) -> list[Edge]:
-        if file:
-            rows = self.conn.execute(
-                "SELECT source_name, source_file, target_name, target_file, relationship "
-                "FROM edges WHERE target_name = ? AND target_file = ?",
-                (name, file),
-            ).fetchall()
-        else:
-            rows = self.conn.execute(
-                "SELECT source_name, source_file, target_name, target_file, relationship "
-                "FROM edges WHERE target_name = ?",
-                (name,),
-            ).fetchall()
-        return [Edge(*r) for r in rows]
-
     def get_colocated_symbols(self, file: str) -> list[Symbol]:
         rows = self.conn.execute(
             "SELECT id, name, kind, file, line, end_line, language, context "
@@ -363,4 +407,23 @@ class LoomDB:
             end_line=row[5],
             language=row[6],
             context=row[7],
+        )
+
+    @staticmethod
+    def _row_to_edge(row: tuple) -> Edge:  # type: ignore[type-arg]
+        """Construct Edge from a DB row.
+
+        Row column order:
+          (id, source_id, target_id, target_name, target_file, relationship, confidence,
+           original_name)
+        """
+        return Edge(
+            id=row[0],
+            source_id=row[1],
+            target_id=row[2],
+            target_name=row[3],
+            target_file=row[4],
+            relationship=row[5],
+            confidence=row[6],
+            original_name=row[7] if len(row) > 7 else None,
         )
