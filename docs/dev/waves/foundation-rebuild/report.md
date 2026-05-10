@@ -20,4 +20,6 @@
 
 ## Execution Log
 
-*(updated after each pipeline completes)*
+- [x] `foundation-data-model` — **DONE** ✓ (319 tests, 94.89% coverage, commit f658029, docs 9531909)
+- [ ] `graph-and-scoring` — pending
+- [ ] `evolutionary-coupling` — pending
