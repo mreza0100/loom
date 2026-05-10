@@ -16,6 +16,7 @@ from loom.config import LoomConfig
 from loom.indexer.embedder import Embedder
 from loom.indexer.parser import parse_file
 from loom.store.db import LoomDB
+from loom.store.graph import SymbolGraph
 from loom.store.models import Edge
 
 log = logging.getLogger(__name__)
@@ -39,10 +40,17 @@ def _resolve_import_path(import_path: str, source_file: str) -> str:
 
 
 class IndexPipeline:
-    def __init__(self, config: LoomConfig, db: LoomDB, embedder: Embedder) -> None:
+    def __init__(
+        self,
+        config: LoomConfig,
+        db: LoomDB,
+        embedder: Embedder,
+        graph: SymbolGraph | None = None,
+    ) -> None:
         self._config = config
         self._db = db
         self._embedder = embedder
+        self._graph = graph
 
     def full_index(self) -> dict[str, int]:
         target = self._config.target_dir
@@ -51,6 +59,8 @@ class IndexPipeline:
         result = self._parse_all_files(files)
         resolved = self._resolve_all_edges()
         result["resolved"] = resolved
+        if self._graph is not None:
+            self._graph.build_from_db(self._db)
         return result
 
     def incremental_index(self, changed_paths: list[Path]) -> dict[str, int]:
@@ -71,6 +81,8 @@ class IndexPipeline:
         # Re-resolve ALL unresolved edges: newly indexed symbols may resolve older unresolved edges
         resolved = self._resolve_all_edges()
         result["resolved"] = resolved
+        if self._graph is not None:
+            self._graph.build_from_db(self._db)
         return result
 
     def _parse_all_files(self, files: list[Path]) -> dict[str, int]:

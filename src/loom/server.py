@@ -12,6 +12,7 @@ from loom.indexer.pipeline import IndexPipeline
 from loom.indexer.watcher import start_watcher
 from loom.search.engine import SearchEngine
 from loom.store.db import LoomDB
+from loom.store.graph import SymbolGraph
 from loom.store.models import CoupledSymbol, SearchResult, Symbol
 
 log = logging.getLogger(__name__)
@@ -21,6 +22,7 @@ mcp = FastMCP("loom")
 _config: LoomConfig | None = None
 _db: LoomDB | None = None
 _embedder: Embedder | None = None
+_graph: SymbolGraph | None = None
 _pipeline: IndexPipeline | None = None
 _engine: SearchEngine | None = None
 
@@ -59,14 +61,15 @@ def _format_results(results: list[SearchResult]) -> list[dict[str, Any]]:
 
 
 def initialize(target_dir: Path) -> None:
-    global _config, _db, _embedder, _pipeline, _engine
+    global _config, _db, _embedder, _graph, _pipeline, _engine
 
     _config = LoomConfig(target_dir=target_dir.resolve())
     _db = LoomDB(_config)
     _db.connect()
     _embedder = Embedder(_config)
-    _pipeline = IndexPipeline(_config, _db, _embedder)
-    _engine = SearchEngine(_db, _embedder)
+    _graph = SymbolGraph()
+    _pipeline = IndexPipeline(_config, _db, _embedder, graph=_graph)
+    _engine = SearchEngine(_db, _embedder, graph=_graph, config=_config)
 
     log.info("Loom initialized for %s", target_dir)
 

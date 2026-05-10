@@ -2,8 +2,11 @@
 
 import logging
 
+from loom.config import LoomConfig
 from loom.indexer.embedder import Embedder
+from loom.search.scoring import compute_semantic, compute_structural, fuse_signals
 from loom.store.db import LoomDB
+from loom.store.graph import SymbolGraph
 from loom.store.models import CoupledSymbol, SearchResult, Symbol
 
 log = logging.getLogger(__name__)
@@ -98,9 +101,24 @@ def _normalize_scores(results: list[tuple[int, float]]) -> list[tuple[int, float
 
 
 class SearchEngine:
-    def __init__(self, db: LoomDB, embedder: Embedder) -> None:
+    def __init__(
+        self,
+        db: LoomDB,
+        embedder: Embedder,
+        graph: SymbolGraph | None = None,
+        config: LoomConfig | None = None,
+    ) -> None:
         self._db = db
         self._embedder = embedder
+        self._graph = graph
+        # Use provided config or fall back to a default with a sentinel target_dir
+        self._config: LoomConfig = (
+            config
+            if config is not None
+            else LoomConfig(
+                target_dir=db._config.target_dir,  # noqa: SLF001
+            )
+        )
 
     def search(
         self,
@@ -185,35 +203,55 @@ class SearchEngine:
         dependents: list[CoupledSymbol] = []
         seen: set[int | None] = {target.id}
 
-        # Resolved incoming edges: use ID-based lookup
-        if target.id is not None:
-            resolved_incoming = self._db.get_edges_to(target.id)
-            for edge in resolved_incoming:
-                source_sym = self._db.get_symbol_by_id(edge.source_id)
+        # --- Structural hits via graph (Phase 4+) ---
+        if self._graph is not None and target.id is not None:
+            structural_hits = self._graph.impact_radius(target.id, max_depth=3)
+            for sym_id, decay_score in structural_hits:
+                if sym_id in seen:
+                    continue
+                source_sym = self._db.get_symbol_by_id(sym_id)
                 if source_sym is None:
                     continue
-                # Filter generic source names
                 if source_sym.name.split(".")[-1] in _GENERIC_CALL_TARGETS:
                     continue
-                if source_sym.id in seen:
-                    continue
-                seen.add(source_sym.id)
+                seen.add(sym_id)
+                # Build a CouplingScore for the breakdown string
+                cs = fuse_signals(decay_score, 0.0, 0.0, self._config)
                 dependents.append(
                     CoupledSymbol(
                         symbol=source_sym,
-                        score=0.8,
-                        reason=f"{edge.relationship} (structural)",
+                        score=decay_score,
+                        reason=cs.breakdown(),
                     ),
                 )
+        else:
+            # Fallback: one-hop DB traversal (no graph available)
+            if target.id is not None:
+                resolved_incoming = self._db.get_edges_to(target.id)
+                for edge in resolved_incoming:
+                    source_sym = self._db.get_symbol_by_id(edge.source_id)
+                    if source_sym is None:
+                        continue
+                    if source_sym.name.split(".")[-1] in _GENERIC_CALL_TARGETS:
+                        continue
+                    if source_sym.id in seen:
+                        continue
+                    seen.add(source_sym.id)
+                    dependents.append(
+                        CoupledSymbol(
+                            symbol=source_sym,
+                            score=0.8,
+                            reason=f"{edge.relationship} (structural)",
+                        ),
+                    )
 
-        # Unresolved incoming edges: find by target_name match
-        # These are callers that haven't been Phase-2-resolved yet
+        # --- Unresolved callers fallback (always kept — graph only has resolved edges) ---
         unresolved_by_name = self._db.get_edges_to_by_name(target.name)
         for edge in unresolved_by_name:
             # Skip if resolved to a different symbol (false positive by name)
             if edge.target_id is not None and edge.target_id != target.id:
                 continue
-            # Skip already-resolved edges (already handled above)
+            # Skip already-resolved edges (handled above)
             if edge.target_id == target.id:
                 continue
             source_sym = self._db.get_symbol_by_id(edge.source_id)
@@ -232,25 +270,38 @@ class SearchEngine:
                 ),
             )
 
+        # --- Semantic hits ---
         if target.id is not None:
             sym_text = self._embedder.build_symbol_text(target.name, target.kind, target.context)
             embedding = self._embedder.embed_single(sym_text)
             vec_hits = self._db.search_vec(embedding, limit=10)
+
+            # Build structural score map for fusion
+            structural_scores: dict[int, float] = {
+                d.symbol.id: d.score for d in dependents if d.symbol.id is not None
+            }
+
             for sym_id, distance in vec_hits:
                 if sym_id in seen:
                     continue
-                seen.add(sym_id)
                 sym = self._db.get_symbol_by_id(sym_id)
-                if sym:
-                    sim = max(0.0, 1.0 - distance)
-                    if sim > 0.3:
-                        dependents.append(
-                            CoupledSymbol(
-                                symbol=sym,
-                                score=sim,
-                                reason="semantically similar",
-                            ),
-                        )
+                if sym is None:
+                    continue
+                if sym.name.split(".")[-1] in _GENERIC_CALL_TARGETS:
+                    continue
+                semantic_score = compute_semantic(distance)
+                if semantic_score <= 0.3:
+                    continue
+                seen.add(sym_id)
+                struct_score = structural_scores.get(sym_id, 0.0)
+                cs = fuse_signals(struct_score, semantic_score, 0.0, self._config)
+                dependents.append(
+                    CoupledSymbol(
+                        symbol=sym,
+                        score=cs.combined,
+                        reason=cs.breakdown(),
+                    ),
+                )
 
         if kind:
             dependents = [d for d in dependents if d.symbol.kind == kind]
@@ -290,72 +341,149 @@ class SearchEngine:
     def _find_coupled(self, target: Symbol) -> list[CoupledSymbol]:
         """Find all symbols structurally/semantically coupled to target.
 
-        Uses ID-based edge traversal. Unresolved edges (target_id=None) are skipped
-        for outgoing traversal — only resolved edges are followed.
+        Phase 5 path (graph available): uses graph.neighbors_with_metadata for multi-hop
+        structural traversal, computes real coupling scores via scoring module, and fuses
+        with semantic vector search results.
+
+        Fallback path (no graph): one-hop DB edge traversal with hardcoded 0.7/0.6 scores.
         """
         coupled: list[CoupledSymbol] = []
         seen: set[int | None] = {target.id}
 
-        if target.id is not None:
-            # Outgoing edges: only follow resolved ones (target_id is not None)
-            outgoing = self._db.get_edges_from(target.id)
-            for edge in outgoing:
-                # Phase 3 compat: check last segment of dotted expression against filter
-                if edge.target_name.split(".")[-1] in _GENERIC_CALL_TARGETS:
-                    continue
-                if edge.target_id is None:
-                    continue  # unresolved — skip
-                sym = self._db.get_symbol_by_id(edge.target_id)
-                if sym and sym.id not in seen:
-                    seen.add(sym.id)
-                    coupled.append(
-                        CoupledSymbol(
-                            symbol=sym,
-                            score=0.7,
-                            reason=f"{edge.relationship} (structural)",
-                        ),
-                    )
-                if len(coupled) >= MAX_STRUCTURAL_RESULTS:
-                    break
+        # ------------------------------------------------------------------
+        # Structural coupling
+        # ------------------------------------------------------------------
+        structural_scores: dict[int, float] = {}
 
-            # Incoming edges: source is always resolved (source_id always set)
-            incoming = self._db.get_edges_to(target.id)
-            for edge in incoming:
-                source_sym = self._db.get_symbol_by_id(edge.source_id)
-                if source_sym is None:
-                    continue
-                # Filter generic source names
-                if source_sym.name.split(".")[-1] in _GENERIC_CALL_TARGETS:
-                    continue
-                if source_sym.id not in seen:
-                    seen.add(source_sym.id)
-                    coupled.append(
-                        CoupledSymbol(
-                            symbol=source_sym,
-                            score=0.6,
-                            reason="called_by (structural)",
-                        ),
-                    )
-                if len(coupled) >= MAX_STRUCTURAL_RESULTS:
-                    break
-
-        # Semantic coupling via vector search
-        if target.id is not None:
-            sym_text = self._embedder.build_symbol_text(target.name, target.kind, target.context)
-            embedding = self._embedder.embed_single(sym_text)
-            vec_hits = self._db.search_vec(embedding, limit=10)
-            for sym_id, distance in vec_hits:
+        if self._graph is not None and target.id is not None:
+            # Phase 5: multi-hop graph traversal with real scoring
+            neighbors = self._graph.neighbors_with_metadata(target.id, max_depth=2)
+            for sym_id, depth, relationship, confidence in neighbors:
                 if sym_id in seen:
                     continue
-                seen.add(sym_id)
+                # Filter generic names from structural results
                 sym = self._db.get_symbol_by_id(sym_id)
-                if sym:
-                    sim = max(0.0, 1.0 - distance)
-                    if sim > 0.3:
+                if sym is None:
+                    continue
+                if sym.name.split(".")[-1] in _GENERIC_CALL_TARGETS:
+                    continue
+                struct_score = compute_structural(relationship, confidence, depth)
+                structural_scores[sym_id] = struct_score
+                seen.add(sym_id)
+
+            # Build initial coupled list from structural neighbors
+            for sym_id, struct_score in structural_scores.items():
+                sym = self._db.get_symbol_by_id(sym_id)
+                if sym is None:
+                    continue
+                cs = fuse_signals(struct_score, 0.0, 0.0, self._config)
+                coupled.append(
+                    CoupledSymbol(
+                        symbol=sym,
+                        score=cs.combined,
+                        reason=cs.breakdown(),
+                    ),
+                )
+                if len(coupled) >= MAX_STRUCTURAL_RESULTS:
+                    break
+
+        else:
+            # Fallback: one-hop DB traversal with hardcoded scores
+            if target.id is not None:
+                # Outgoing edges: only follow resolved ones
+                outgoing = self._db.get_edges_from(target.id)
+                for edge in outgoing:
+                    if edge.target_name.split(".")[-1] in _GENERIC_CALL_TARGETS:
+                        continue
+                    if edge.target_id is None:
+                        continue  # unresolved — skip
+                    sym = self._db.get_symbol_by_id(edge.target_id)
+                    if sym and sym.id not in seen:
+                        seen.add(sym.id)
                         coupled.append(
                             CoupledSymbol(
                                 symbol=sym,
-                                score=sim,
+                                score=0.7,
+                                reason=f"{edge.relationship} (structural)",
+                            ),
+                        )
+                    if len(coupled) >= MAX_STRUCTURAL_RESULTS:
+                        break
+
+                # Incoming edges
+                incoming = self._db.get_edges_to(target.id)
+                for edge in incoming:
+                    source_sym = self._db.get_symbol_by_id(edge.source_id)
+                    if source_sym is None:
+                        continue
+                    if source_sym.name.split(".")[-1] in _GENERIC_CALL_TARGETS:
+                        continue
+                    if source_sym.id not in seen:
+                        seen.add(source_sym.id)
+                        coupled.append(
+                            CoupledSymbol(
+                                symbol=source_sym,
+                                score=0.6,
+                                reason="called_by (structural)",
+                            ),
+                        )
+                    if len(coupled) >= MAX_STRUCTURAL_RESULTS:
+                        break
+
+        # ------------------------------------------------------------------
+        # Semantic coupling via vector search
+        # ------------------------------------------------------------------
+        if target.id is not None:
+            sym_text = self._embedder.build_symbol_text(target.name, target.kind, target.context)
+            embedding = self._embedder.embed_single(sym_text)
+            vec_hits = self._db.search_vec(embedding, limit=20)
+
+            for sym_id, distance in vec_hits:
+                semantic_score = compute_semantic(distance)
+                if semantic_score <= 0.3:
+                    continue
+
+                if self._graph is not None:
+                    # Phase 5: fuse with structural score if both signals present
+                    if sym_id in seen:
+                        # Already in coupled list from structural pass — find and update
+                        # by building a fused score (structural_scores has the raw struct value)
+                        struct_score = structural_scores.get(sym_id, 0.0)
+                        if struct_score > 0.0:
+                            cs = fuse_signals(struct_score, semantic_score, 0.0, self._config)
+                            # Update the existing entry in-place
+                            for c in coupled:
+                                if c.symbol.id == sym_id:
+                                    coupled[coupled.index(c)] = CoupledSymbol(
+                                        symbol=c.symbol,
+                                        score=cs.combined,
+                                        reason=cs.breakdown(),
+                                    )
+                                    break
+                        continue
+                    # New entry: semantic-only
+                    seen.add(sym_id)
+                    sym = self._db.get_symbol_by_id(sym_id)
+                    if sym:
+                        cs = fuse_signals(0.0, semantic_score, 0.0, self._config)
+                        coupled.append(
+                            CoupledSymbol(
+                                symbol=sym,
+                                score=cs.combined,
+                                reason=cs.breakdown(),
+                            ),
+                        )
+                else:
+                    # Fallback path: raw similarity score
+                    if sym_id in seen:
+                        continue
+                    seen.add(sym_id)
+                    sym = self._db.get_symbol_by_id(sym_id)
+                    if sym:
+                        coupled.append(
+                            CoupledSymbol(
+                                symbol=sym,
+                                score=semantic_score,
                                 reason="semantically similar",
                             ),
                         )
