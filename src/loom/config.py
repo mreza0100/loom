@@ -20,6 +20,10 @@ class LoomConfig:
             {"node_modules", ".git", "dist", "build", ".next", "coverage", "__pycache__"},
         ),
     )
+    # Coupling signal weights — must sum to 1.0 when all signals active
+    structural_weight: float = 0.45
+    semantic_weight: float = 0.35
+    evolutionary_weight: float = 0.20
 
     def resolve_db_path(self) -> Path:
         return self.target_dir / self.db_path

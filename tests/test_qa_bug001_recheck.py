@@ -469,9 +469,7 @@ class TestRowToEdgeOriginalName:
         ]
         assert len(import_edges) >= 1
         got = import_edges[0].original_name
-        assert got is None, (
-            f"Non-aliased import original_name should be None, got {got!r}"
-        )
+        assert got is None, f"Non-aliased import original_name should be None, got {got!r}"
 
 
 # ---------------------------------------------------------------------------
