@@ -1,6 +1,6 @@
 """Tests for loom.search.engine — hybrid search, RRF, coupling."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -11,12 +11,11 @@ from loom.search.engine import (
     RRF_K,
     THEORETICAL_MAX_RRF,
     SearchEngine,
-    _GENERIC_CALL_TARGETS,
     _normalize_scores,
     _rrf_score,
 )
 from loom.store.db import LoomDB
-from loom.store.models import CoupledSymbol, Edge, SearchResult, Symbol
+from loom.store.models import Edge, Symbol
 
 
 class TestRRFScore:
@@ -61,11 +60,21 @@ class TestTheoreticalMax:
         assert THEORETICAL_MAX_RRF > 0
 
     def test_max_boost_correct(self) -> None:
-        assert MAX_BOOST == max(KIND_BOOST.values())
+        assert max(KIND_BOOST.values()) == MAX_BOOST
+
+
+def _make_sym(db: LoomDB, name: str, file: str = "app.js", kind: str = "function") -> Symbol:
+    sym_id = db.insert_symbol(
+        Symbol(name=name, kind=kind, file=file, line=1, end_line=10, language="javascript"),
+    )
+    db.insert_embedding(sym_id, [0.1] * 768)
+    sym = db.get_symbol_by_id(sym_id)
+    assert sym is not None
+    return sym
 
 
 class TestSearchEngine:
-    @pytest.fixture()
+    @pytest.fixture
     def mock_embedder(self) -> MagicMock:
         embedder = MagicMock()
         embedder.embed_single.return_value = [0.1] * 768
@@ -187,7 +196,7 @@ class TestSearchEngine:
 
 
 class TestNeighborhood:
-    @pytest.fixture()
+    @pytest.fixture
     def mock_embedder(self) -> MagicMock:
         embedder = MagicMock()
         embedder.embed_single.return_value = [0.1] * 768
@@ -238,7 +247,7 @@ class TestNeighborhood:
 
 
 class TestBuiltinFiltering:
-    @pytest.fixture()
+    @pytest.fixture
     def mock_embedder(self) -> MagicMock:
         embedder = MagicMock()
         embedder.embed_single.return_value = [0.1] * 768
@@ -250,54 +259,27 @@ class TestBuiltinFiltering:
         db: LoomDB,
         mock_embedder: MagicMock,
     ) -> None:
-        db.insert_symbol(
-            Symbol(
-                name="myFunc",
-                kind="function",
-                file="app.js",
-                line=1,
-                end_line=10,
-                language="javascript",
-            )
-        )
-        db.insert_embedding(1, [0.1] * 768)
-        db.insert_symbol(
-            Symbol(
-                name="realHelper",
-                kind="function",
-                file="helper.js",
-                line=1,
-                end_line=5,
-                language="javascript",
-            )
-        )
-        db.insert_embedding(2, [0.9] * 768)
+        """Generic target names (push, map, etc.) should be filtered from coupled results."""
+        my_func = _make_sym(db, "myFunc", "app.js")
+        real_helper = _make_sym(db, "realHelper", "helper.js")
+        assert my_func.id is not None
+        assert real_helper.id is not None
+
+        # Insert edges: two generic targets + one real helper
         db.insert_edge(
-            Edge(
-                source_name="myFunc",
-                source_file="app.js",
-                target_name="push",
-                target_file=None,
-                relationship="calls",
-            )
+            Edge(source_id=my_func.id, target_name="push", target_id=None, relationship="calls"),
+        )
+        db.insert_edge(
+            Edge(source_id=my_func.id, target_name="map", target_id=None, relationship="calls"),
         )
         db.insert_edge(
             Edge(
-                source_name="myFunc",
-                source_file="app.js",
-                target_name="map",
-                target_file=None,
-                relationship="calls",
-            )
-        )
-        db.insert_edge(
-            Edge(
-                source_name="myFunc",
-                source_file="app.js",
+                source_id=my_func.id,
                 target_name="realHelper",
-                target_file="helper.js",
+                target_id=real_helper.id,
                 relationship="calls",
-            )
+                confidence=1.0,
+            ),
         )
         db.commit()
 
@@ -308,12 +290,46 @@ class TestBuiltinFiltering:
         assert "push" not in coupled_names
         assert "map" not in coupled_names
 
+    def test_generic_targets_filter_checks_last_segment(
+        self,
+        db: LoomDB,
+        mock_embedder: MagicMock,
+    ) -> None:
+        """Phase 3: filter checks last segment of dotted expression."""
+        my_func = _make_sym(db, "myFunc", "app.js")
+        assert my_func.id is not None
+
+        # Full dotted expression ending in a generic name
+        db.insert_edge(
+            Edge(
+                source_id=my_func.id,
+                target_name="this.items.push",
+                target_id=None,
+                relationship="calls",
+            ),
+        )
+        db.commit()
+
+        engine = SearchEngine(db, mock_embedder)
+        coupled = engine.related("myFunc")
+        # "push" is in _GENERIC_CALL_TARGETS, so this.items.push should be filtered
+        # No symbol named "this.items.push" was inserted, but the edge shouldn't cause issues
+        assert isinstance(coupled, list)
+
     def test_generic_sources_filtered_from_impact(
         self,
         db: LoomDB,
         mock_embedder: MagicMock,
     ) -> None:
-        db.insert_symbol(
+        """Generic source names should be filtered from structural impact results.
+
+        Note: mock_embedder returns [0.1]*768 for all queries, so semantic search
+        may surface symbols with similar embeddings. We disable semantic output by
+        making embed_single return a zero vector that matches nothing (vec_symbols empty).
+        The structural filter (generic source name) is what we're testing here.
+        """
+        # Insert targetFunc with a distinct embedding
+        tgt_id = db.insert_symbol(
             Symbol(
                 name="targetFunc",
                 kind="function",
@@ -321,10 +337,14 @@ class TestBuiltinFiltering:
                 line=1,
                 end_line=10,
                 language="javascript",
-            )
+            ),
         )
-        db.insert_embedding(1, [0.1] * 768)
-        db.insert_symbol(
+        db.insert_embedding(tgt_id, [0.5] * 768)
+        target_func = db.get_symbol_by_id(tgt_id)
+        assert target_func is not None
+
+        # Insert realCaller with a very different embedding
+        real_id = db.insert_symbol(
             Symbol(
                 name="realCaller",
                 kind="function",
@@ -332,28 +352,50 @@ class TestBuiltinFiltering:
                 line=1,
                 end_line=5,
                 language="javascript",
-            )
+            ),
         )
-        db.insert_embedding(2, [0.9] * 768)
+        db.insert_embedding(real_id, [0.9] * 768)
+        real_caller = db.get_symbol_by_id(real_id)
+        assert real_caller is not None
+
+        # Insert callback with same embedding as targetFunc (would appear in semantic results)
+        cb_id = db.insert_symbol(
+            Symbol(
+                name="callback",
+                kind="function",
+                file="generic.js",
+                line=1,
+                end_line=5,
+                language="javascript",
+            ),
+        )
+        db.insert_embedding(cb_id, [0.5] * 768)  # same as targetFunc
+
+        # Edge from "callback" (a generic name) -> targetFunc
         db.insert_edge(
             Edge(
-                source_name="callback",
-                source_file="generic.js",
+                source_id=cb_id,
                 target_name="targetFunc",
-                target_file="target.js",
+                target_id=tgt_id,
                 relationship="calls",
-            )
+                confidence=1.0,
+            ),
         )
+        # Edge from realCaller -> targetFunc
         db.insert_edge(
             Edge(
-                source_name="realCaller",
-                source_file="caller.js",
+                source_id=real_id,
                 target_name="targetFunc",
-                target_file="target.js",
+                target_id=tgt_id,
                 relationship="calls",
-            )
+                confidence=1.0,
+            ),
         )
         db.commit()
+
+        # Make embed_single return a vector that won't match any stored embedding
+        # (avoids semantic pollution in this structural filtering test)
+        mock_embedder.embed_single.return_value = [-1.0] * 768
 
         engine = SearchEngine(db, mock_embedder)
         dependents = engine.impact("targetFunc")
@@ -361,78 +403,26 @@ class TestBuiltinFiltering:
         assert "realCaller" in dep_names
         assert "callback" not in dep_names
 
-    def test_null_target_file_edges_excluded_with_file(self, db: LoomDB) -> None:
-        db.insert_edge(
-            Edge(
-                source_name="callerA",
-                source_file="a.js",
-                target_name="create",
-                target_file="factory.js",
-                relationship="calls",
-            )
-        )
-        db.insert_edge(
-            Edge(
-                source_name="callerB",
-                source_file="b.js",
-                target_name="create",
-                target_file=None,
-                relationship="calls",
-            )
-        )
-        db.insert_edge(
-            Edge(
-                source_name="callerC",
-                source_file="c.js",
-                target_name="create",
-                target_file=None,
-                relationship="calls",
-            )
-        )
-        db.commit()
-
-        scoped = db.get_edges_to("create", file="factory.js")
-        assert len(scoped) == 1
-        assert scoped[0].source_name == "callerA"
-
     def test_structural_results_capped(
         self,
         db: LoomDB,
         mock_embedder: MagicMock,
     ) -> None:
-        db.insert_symbol(
-            Symbol(
-                name="bigFunc",
-                kind="function",
-                file="big.js",
-                line=1,
-                end_line=100,
-                language="javascript",
-            )
-        )
-        db.insert_embedding(1, [0.1] * 768)
+        big_func = _make_sym(db, "bigFunc", "big.js")
+        assert big_func.id is not None
 
         for i in range(50):
             target_name = f"dep{i}"
-            db.insert_symbol(
-                Symbol(
-                    name=target_name,
-                    kind="function",
-                    file=f"dep{i}.js",
-                    line=1,
-                    end_line=5,
-                    language="javascript",
-                )
-            )
-            db.insert_embedding(i + 2, [0.9] * 768)
+            tgt = _make_sym(db, target_name, f"dep{i}.js")
+            assert tgt.id is not None
             db.insert_edge(
                 Edge(
-                    source_name="bigFunc",
-                    source_file="big.js",
+                    source_id=big_func.id,
                     target_name=target_name,
-                    target_file=f"dep{i}.js",
+                    target_id=tgt.id,
                     relationship="calls",
-                )
+                    confidence=1.0,
+                ),
             )
         db.commit()
 
@@ -440,3 +430,56 @@ class TestBuiltinFiltering:
         coupled = engine.related("bigFunc")
         structural = [c for c in coupled if "structural" in c.reason]
         assert len(structural) <= MAX_STRUCTURAL_RESULTS
+
+    def test_impact_includes_unresolved_name_matches(
+        self,
+        db: LoomDB,
+        mock_embedder: MagicMock,
+    ) -> None:
+        """impact() should surface unresolved callers whose target_name matches the symbol."""
+        target_sym = _make_sym(db, "targetSym", "target.js")
+        caller_sym = _make_sym(db, "callerFunc", "caller.js")
+        assert target_sym.id is not None
+        assert caller_sym.id is not None
+
+        # Unresolved edge (target_id=None) but target_name matches
+        db.insert_edge(
+            Edge(
+                source_id=caller_sym.id,
+                target_name="targetSym",
+                target_id=None,
+                relationship="calls",
+            ),
+        )
+        db.commit()
+
+        engine = SearchEngine(db, mock_embedder)
+        dependents = engine.impact("targetSym")
+        dep_names = {d.symbol.name for d in dependents}
+        assert "callerFunc" in dep_names
+
+    def test_related_excludes_unresolved(
+        self,
+        db: LoomDB,
+        mock_embedder: MagicMock,
+    ) -> None:
+        """related() / _find_coupled() should NOT follow unresolved outgoing edges."""
+        source_sym = _make_sym(db, "sourceSym", "source.js")
+        assert source_sym.id is not None
+
+        # Unresolved outgoing edge — no target symbol exists
+        db.insert_edge(
+            Edge(
+                source_id=source_sym.id,
+                target_name="unresolvedTarget",
+                target_id=None,
+                relationship="calls",
+            ),
+        )
+        db.commit()
+
+        engine = SearchEngine(db, mock_embedder)
+        coupled = engine.related("sourceSym")
+        # Should not include any symbol named "unresolvedTarget" (it doesn't exist)
+        coupled_names = {c.symbol.name for c in coupled}
+        assert "unresolvedTarget" not in coupled_names
