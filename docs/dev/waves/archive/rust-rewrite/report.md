@@ -27,46 +27,51 @@
 - [x] `rust-foundation` — **DONE** — Rust foundation implemented and verified after installing Rust toolchain
 
 ### Wave 2
-- [ ] `rust-parsers` — Rust tree-sitter parser infrastructure and seven language adapters (2 tasks)
+- [x] `rust-parsers` — **DONE** — Rust tree-sitter parser infrastructure and seven language adapters (2 tasks)
 
 ### Wave 3
-- [ ] `rust-indexer` — Candle embeddings, staged indexing pipeline, watcher, git analyzer (3 tasks)
+- [x] `rust-indexer` — **DONE** — Candle embeddings, staged indexing pipeline, watcher, git analyzer (3 tasks)
 
 ### Wave 4
-- [ ] `rust-productization` — search, MCP CLI/server, distribution (3 tasks)
+- [x] `rust-productization` — **DONE** — search, MCP CLI/server, distribution (3 tasks)
 
 ## Pipeline Results
 
 | Pipeline | Result | Notes |
 |---|---|---|
 | `rust-foundation` | DONE | Planner, architect, developer, QA, and one fix-loop iteration completed. Rust installed via rustup; cargo build/test/fmt/clippy pass. |
-| `rust-parsers` | PENDING | Unblocked after `rust-foundation`; next pipeline. |
-| `rust-indexer` | PENDING | Depends on `rust-parsers`. |
-| `rust-productization` | PENDING | Depends on `rust-indexer`. |
+| `rust-parsers` | DONE | Parser adapters implemented and audit fixes committed. |
+| `rust-indexer` | DONE | Embedder, index pipeline, watcher, and git analyzer implemented; audit blockers fixed. |
+| `rust-productization` | DONE | Rust search/scoring, rmcp CLI/server, and distribution metadata implemented; QA/audit blockers fixed. |
 
 ## Verification Snapshot
 
 - Rust toolchain: PASS, `cargo 1.95.0`.
 - `cargo build --workspace`: PASS.
-- `cargo test --workspace`: PASS, 15 Rust tests passed.
+- `cargo test --workspace`: PASS, 54 Rust tests passed.
 - `cargo fmt --all -- --check`: PASS.
 - `cargo clippy --workspace -- -D warnings`: PASS.
 - `uv run pytest --tb=short`: PASS, `855 passed`, coverage `91.69%`.
 - `uv run ruff check`: PASS.
 - `uv run mypy src`: PASS.
-- `uv run ruff format --check`: FAIL on pre-existing `src/loom/indexer/pipeline.py` formatting.
+- `uvx maturin build --manifest-path crates/loom-mcp/Cargo.toml --out /tmp/loom-maturin-dist`: PASS, wheel includes Rust binary and Python package.
 - Worktrees: only main worktree present.
 
 ## Final Summary
 
-**Completed:** 2026-05-11 19:34:35 CEST | **Pipelines:** 0 succeeded, 0 failed, 4 deferred
+**Completed:** 2026-05-11 CEST | **Pipelines:** 4 succeeded, 0 failed, 0 deferred
 
 | Pipeline | Tasks | Status | Notes |
 |---|---:|---|---|
-| `rust-foundation` | 3 | BLOCKED-DEFERRED | Missing Cargo blocks Rust verification and merge. |
-| `rust-parsers` | 2 | BLOCKED-DEFERRED | Deferred due dependency on `rust-foundation`. |
-| `rust-indexer` | 3 | BLOCKED-DEFERRED | Deferred due dependency on `rust-foundation` and `rust-parsers`. |
-| `rust-productization` | 3 | BLOCKED-DEFERRED | Deferred due dependency on unverified Rust stack. |
+| `rust-foundation` | 3 | DONE | Local commits through `9f726a2`; no push. |
+| `rust-parsers` | 2 | DONE | Local commits through `c68cf35`; no push. |
+| `rust-indexer` | 3 | DONE | Local commits through `f00123b`; no push. |
+| `rust-productization` | 3 | DONE | Implemented and verified in current local commit set; no push. |
+
+## Deferred Follow-Ups
+
+- Rust vector search still uses the current blob-vector full scan backend. sqlite-vec/ANN wiring should be a dedicated store/search pipeline.
+- Server startup does not auto-index or start a watcher. Users must call `reindex`; watcher lifecycle should be a dedicated product behavior decision.
 
 ## Professor's Wave Review
 

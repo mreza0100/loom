@@ -62,6 +62,7 @@ Each signal alone produces false positives. Together, they triangulate.
 git clone https://github.com/mreza0100/loom.git
 cd loom
 uv sync
+cargo build --workspace
 ```
 
 ### Connect to Claude Code
@@ -72,11 +73,9 @@ Add to `.mcp.json` in any project you want to index:
 {
   "mcpServers": {
     "loom": {
-      "command": "uv",
+      "command": "/path/to/loom/target/debug/loom-mcp",
       "args": [
-        "run", "--directory", "/path/to/loom",
-        "python", "-m", "loom",
-        "/path/to/your/project"
+        "--target", "/path/to/your/project"
       ]
     }
   }
@@ -93,23 +92,23 @@ Add to `.mcp.json` in any project you want to index:
 {
   "mcpServers": {
     "loom": {
-      "command": "uv",
-      "args": ["run", "--directory", "/path/to/loom", "python", "-m", "loom", "/path/to/your/project"]
+      "command": "/path/to/loom/target/debug/loom-mcp",
+      "args": ["--target", "/path/to/your/project"]
     }
   }
 }
 ```
 
 **Cursor** — Settings → MCP → Add server:
-- Command: `uv run --directory /path/to/loom python -m loom /path/to/your/project`
+- Command: `/path/to/loom/target/debug/loom-mcp --target /path/to/your/project`
 
 **VS Code** — `.vscode/mcp.json`:
 ```json
 {
   "servers": {
     "loom": {
-      "command": "uv",
-      "args": ["run", "--directory", "/path/to/loom", "python", "-m", "loom", "${workspaceFolder}"]
+      "command": "/path/to/loom/target/debug/loom-mcp",
+      "args": ["--target", "${workspaceFolder}"]
     }
   }
 }
@@ -158,36 +157,39 @@ When you search for A, Loom returns A's results **plus** every symbol whose coup
 
 | Component | Choice |
 |-----------|--------|
-| Language | Python 3.12+ |
-| MCP Framework | [FastMCP](https://github.com/jlowin/fastmcp) |
-| AST Parser | [tree-sitter](https://tree-sitter.github.io/) (JS/TS currently, 150+ languages supported) |
-| Graph Engine | NetworkX |
-| Embeddings | jina-embeddings-v2-base-code via [fastembed](https://github.com/qdrant/fastembed) (fully local, no API keys) |
-| Vector Store | [sqlite-vec](https://github.com/asg017/sqlite-vec) |
-| Persistence | Single `.loom.db` SQLite file per project |
+| Language | Rust core + legacy Python reference |
+| MCP Framework | [rmcp](https://docs.rs/rmcp/latest/rmcp/) |
+| AST Parser | [tree-sitter](https://tree-sitter.github.io/) |
+| Graph Engine | petgraph |
+| Embeddings | jina-embeddings-v2-base-code via Candle |
+| Vector Store | SQLite blob vector store now; sqlite-vec backend planned |
+| Persistence | `.loom/loom.db` SQLite database per project |
 
 ## What Happens on First Run
 
-1. Parses every JS/TS file using tree-sitter → extracts symbols and relationships
-2. Generates embeddings using a local model (downloads ~270MB on first run)
-3. Builds the structural graph (call, import, type, co-location edges)
-4. Mines git history for evolutionary coupling
-5. Stores everything in `.loom.db` — subsequent starts are instant (content-hash based incremental updates)
+1. Run `loom-mcp reindex --target /path/to/project`.
+2. Parses supported source files using tree-sitter → extracts symbols and relationships
+3. Generates embeddings using a local model (downloads on first reindex)
+4. Builds the structural graph (call, import, type, co-location edges)
+5. Mines git history for evolutionary coupling
+6. Stores everything in `.loom/loom.db` — subsequent starts are instant (content-hash based incremental updates)
 
 ## Supported Languages
 
-Currently: **JavaScript and TypeScript** (including JSX/TSX, CommonJS, ES modules).
+Currently: **Python, JavaScript, TypeScript, Go, Java, Rust, and C#**.
 
 The architecture supports any language with a tree-sitter grammar. More languages are planned.
 
 ## Development
 
 ```bash
-uv sync                              # install deps
-uv run python -m loom                # run server
-uv run pytest                        # test
-uv run ruff check && uv run ruff format  # lint + format
-uv run mypy                          # type check
+uv sync                              # install Python dev deps
+cargo build --workspace              # build Rust crates
+cargo run -p loom-mcp -- status --target .
+cargo run -p loom-mcp -- reindex --target /path/to/project
+cargo test --workspace               # Rust tests
+uv run pytest                        # Python reference tests
+uv run ruff check && uv run mypy      # Python lint + type check
 ```
 
 ## License

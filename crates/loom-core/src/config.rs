@@ -5,6 +5,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 const ALWAYS_EXCLUDED: [&str; 3] = [".git", "__pycache__", ".loom"];
+const SUPPORTED_EMBEDDING_MODELS: [&str; 1] = ["jinaai/jina-embeddings-v2-base-code"];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LoomConfig {
@@ -14,12 +15,15 @@ pub struct LoomConfig {
     pub watch_extensions: BTreeSet<String>,
     pub debounce_seconds: f64,
     pub embedding_model: String,
+    pub allow_custom_embedding_model: bool,
     pub embedding_dimensions: usize,
     pub max_file_size_bytes: usize,
     pub excluded_dirs: BTreeSet<String>,
     pub structural_weight: f64,
     pub semantic_weight: f64,
     pub evolutionary_weight: f64,
+    pub coupling_threshold: f64,
+    pub top_coupled: usize,
     pub enable_git_analysis: bool,
     pub git_max_commits: usize,
     pub git_max_files_per_commit: usize,
@@ -32,12 +36,15 @@ struct PartialConfig {
     watch_extensions: Option<Vec<String>>,
     debounce_seconds: Option<f64>,
     embedding_model: Option<String>,
+    allow_custom_embedding_model: Option<bool>,
     embedding_dimensions: Option<usize>,
     max_file_size_bytes: Option<usize>,
     excluded_dirs: Option<Vec<String>>,
     structural_weight: Option<f64>,
     semantic_weight: Option<f64>,
     evolutionary_weight: Option<f64>,
+    coupling_threshold: Option<f64>,
+    top_coupled: Option<usize>,
     enable_git_analysis: Option<bool>,
     git_max_commits: Option<usize>,
     git_max_files_per_commit: Option<usize>,
@@ -77,12 +84,15 @@ impl LoomConfig {
             watch_extensions,
             debounce_seconds: 0.5,
             embedding_model: "jinaai/jina-embeddings-v2-base-code".to_string(),
+            allow_custom_embedding_model: false,
             embedding_dimensions: 768,
             max_file_size_bytes: 512_000,
             excluded_dirs,
             structural_weight: 0.45,
             semantic_weight: 0.35,
             evolutionary_weight: 0.20,
+            coupling_threshold: 0.30,
+            top_coupled: 3,
             enable_git_analysis: true,
             git_max_commits: 500,
             git_max_files_per_commit: 20,
@@ -144,6 +154,9 @@ impl LoomConfig {
         if let Some(embedding_model) = partial.embedding_model {
             self.embedding_model = embedding_model;
         }
+        if let Some(allow_custom_embedding_model) = partial.allow_custom_embedding_model {
+            self.allow_custom_embedding_model = allow_custom_embedding_model;
+        }
         if let Some(embedding_dimensions) = partial.embedding_dimensions {
             self.embedding_dimensions = embedding_dimensions;
         }
@@ -162,6 +175,12 @@ impl LoomConfig {
         }
         if let Some(evolutionary_weight) = partial.evolutionary_weight {
             self.evolutionary_weight = evolutionary_weight;
+        }
+        if let Some(coupling_threshold) = partial.coupling_threshold {
+            self.coupling_threshold = coupling_threshold;
+        }
+        if let Some(top_coupled) = partial.top_coupled {
+            self.top_coupled = top_coupled;
         }
         if let Some(enable_git_analysis) = partial.enable_git_analysis {
             self.enable_git_analysis = enable_git_analysis;
@@ -200,10 +219,28 @@ impl LoomConfig {
                 "at least one coupling weight must be positive".to_string(),
             ));
         }
+        if !self.coupling_threshold.is_finite() || !(0.0..=1.0).contains(&self.coupling_threshold) {
+            return Err(LoomError::InvalidConfig(
+                "coupling_threshold must be between 0.0 and 1.0".to_string(),
+            ));
+        }
+        if self.top_coupled == 0 {
+            return Err(LoomError::InvalidConfig(
+                "top_coupled must be positive".to_string(),
+            ));
+        }
         if self.embedding_dimensions == 0 {
             return Err(LoomError::InvalidConfig(
                 "embedding_dimensions must be positive".to_string(),
             ));
+        }
+        if !self.allow_custom_embedding_model
+            && !SUPPORTED_EMBEDDING_MODELS.contains(&self.embedding_model.as_str())
+        {
+            return Err(LoomError::InvalidConfig(format!(
+                "embedding_model must be one of {} unless allow_custom_embedding_model = true",
+                SUPPORTED_EMBEDDING_MODELS.join(", ")
+            )));
         }
         if self.db_path == Path::new("") {
             return Err(LoomError::InvalidConfig(

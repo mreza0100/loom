@@ -9,6 +9,7 @@ use crate::{
     LoomConfig,
 };
 use rayon::prelude::*;
+use serde::Serialize;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fs;
@@ -16,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
 pub struct IndexResult {
     pub indexed: usize,
     pub skipped: usize,

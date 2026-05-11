@@ -9,3 +9,19 @@ resolver = "2"
 edition = "2021"
 rust-version = "1.82"
 license = "MIT"
+description = "AI code intelligence via vector search over pre-indexed codebases"
+homepage = "https://github.com/mreza0100/loom"
+repository = "https://github.com/mreza0100/loom"
+
+[workspace.metadata.dist]
+cargo-dist-version = "0.29.0"
+ci = "github"
+installers = ["shell", "powershell", "homebrew"]
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+]
+install-updater = false
