@@ -11,6 +11,7 @@ pub trait VectorStore: Send + Sync {
         dimensions: usize,
     ) -> Result<()>;
     fn delete_embeddings(&self, conn: &Connection, symbol_ids: &[i64]) -> Result<()>;
+    fn clear(&self, conn: &Connection) -> Result<()>;
     fn count(&self, conn: &Connection) -> Result<i64>;
     fn search(
         &self,
@@ -59,6 +60,11 @@ impl VectorStore for BlobVectorStore {
         let placeholders = repeat_placeholders(symbol_ids.len());
         let sql = format!("DELETE FROM symbol_embeddings WHERE symbol_id IN ({placeholders})");
         conn.execute(&sql, params_from_iter(symbol_ids.iter()))?;
+        Ok(())
+    }
+
+    fn clear(&self, conn: &Connection) -> Result<()> {
+        conn.execute("DELETE FROM symbol_embeddings", [])?;
         Ok(())
     }
 

@@ -21,6 +21,22 @@ pub enum ReaderPragma {
     JournalMode,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportEdgeRow {
+    pub local_name: String,
+    pub source_file: String,
+    pub target_file: String,
+    pub original_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CochangeRow {
+    pub file_a: String,
+    pub file_b: String,
+    pub frequency: i64,
+    pub recency: f64,
+}
+
 impl ReaderPragma {
     #[must_use]
     const fn sql(self) -> &'static str {
@@ -337,6 +353,23 @@ impl LoomDb {
         }
         tx.execute("DELETE FROM symbols WHERE file = ?", [path])?;
         tx.execute("DELETE FROM index_meta WHERE file_path = ?", [path])?;
+        tx.execute(
+            "DELETE FROM cochange WHERE file_a = ? OR file_b = ?",
+            params![path, path],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn clear_index(&self) -> Result<()> {
+        let mut conn = self.writer.lock();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM edges", [])?;
+        tx.execute("DELETE FROM symbols_fts", [])?;
+        tx.execute("DELETE FROM symbols", [])?;
+        tx.execute("DELETE FROM index_meta", [])?;
+        tx.execute("DELETE FROM cochange", [])?;
+        self.vector_store.clear(&tx)?;
         tx.commit()?;
         Ok(())
     }
@@ -422,15 +455,130 @@ impl LoomDb {
         Ok(())
     }
 
+    pub fn set_file_hashes(&self, hashes: &[(String, String)]) -> Result<()> {
+        let mut conn = self.writer.lock();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR REPLACE INTO index_meta (file_path, content_hash) VALUES (?, ?)",
+            )?;
+            for (path, content_hash) in hashes {
+                stmt.execute(params![path, content_hash])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn list_symbol_files(&self) -> Result<Vec<String>> {
+        let conn = self.reader()?;
+        let mut stmt = conn.prepare("SELECT DISTINCT file FROM symbols ORDER BY file")?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        collect_rows(rows)
+    }
+
+    pub fn get_import_edges_with_source_file(&self) -> Result<Vec<ImportEdgeRow>> {
+        let conn = self.reader()?;
+        let mut stmt = conn.prepare(
+            "SELECT e.target_name, s.file, e.target_file, e.original_name
+             FROM edges e
+             JOIN symbols s ON s.id = e.source_id
+             WHERE e.relationship = 'imports' AND e.target_file IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(ImportEdgeRow {
+                local_name: row.get(0)?,
+                source_file: row.get(1)?,
+                target_file: row.get(2)?,
+                original_name: row.get(3)?,
+            })
+        })?;
+        collect_rows(rows)
+    }
+
+    pub fn find_symbols_like_name(
+        &self,
+        pattern: &str,
+        file: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Symbol>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = checked_sql_limit(limit)?;
+        let conn = self.reader()?;
+        if let Some(file) = file {
+            let mut stmt = conn.prepare(
+                "SELECT id, name, kind, file, line, end_line, language, context
+                 FROM symbols WHERE name LIKE ? AND file = ? LIMIT ?",
+            )?;
+            let rows = stmt.query_map(params![pattern, file, limit], row_to_symbol)?;
+            collect_rows(rows)
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT id, name, kind, file, line, end_line, language, context
+                 FROM symbols WHERE name LIKE ? LIMIT ?",
+            )?;
+            let rows = stmt.query_map(params![pattern, limit], row_to_symbol)?;
+            collect_rows(rows)
+        }
+    }
+
+    pub fn resolve_edges_batch(&self, resolutions: &[(i64, i64, f64)]) -> Result<()> {
+        let mut conn = self.writer.lock();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt =
+                tx.prepare("UPDATE edges SET target_id = ?, confidence = ? WHERE id = ?")?;
+            for (edge_id, target_id, confidence) in resolutions {
+                stmt.execute(params![target_id, confidence, edge_id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn upsert_cochange(&self, file_a: &str, file_b: &str, frequency: i64) -> Result<()> {
+        self.upsert_cochange_with_recency(file_a, file_b, frequency, 0.0)
+    }
+
+    pub fn upsert_cochange_with_recency(
+        &self,
+        file_a: &str,
+        file_b: &str,
+        frequency: i64,
+        recency: f64,
+    ) -> Result<()> {
         let (a, b) = canonical_pair(file_a, file_b);
         let conn = self.writer.lock();
         conn.execute(
-            "INSERT INTO cochange (file_a, file_b, frequency) VALUES (?, ?, ?)
-             ON CONFLICT(file_a, file_b) DO UPDATE SET frequency = excluded.frequency",
-            params![a, b, frequency],
+            "INSERT INTO cochange (file_a, file_b, frequency, recency) VALUES (?, ?, ?, ?)
+             ON CONFLICT(file_a, file_b) DO UPDATE SET
+                frequency = excluded.frequency,
+                recency = excluded.recency",
+            params![a, b, frequency, recency],
         )?;
         Ok(())
+    }
+
+    pub fn get_cochange(&self, file_a: &str, file_b: &str) -> Result<Option<CochangeRow>> {
+        let (a, b) = canonical_pair(file_a, file_b);
+        let conn = self.reader()?;
+        conn.query_row(
+            "SELECT file_a, file_b, frequency, recency FROM cochange
+             WHERE file_a = ? AND file_b = ?",
+            params![a, b],
+            |row| {
+                Ok(CochangeRow {
+                    file_a: row.get(0)?,
+                    file_b: row.get(1)?,
+                    frequency: row.get(2)?,
+                    recency: row.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(LoomError::from)
     }
 
     pub fn get_cochange_frequency(&self, file_a: &str, file_b: &str) -> Result<i64> {
@@ -456,7 +604,7 @@ impl LoomDb {
         let mut stmt = conn.prepare(
             "SELECT CASE WHEN file_a = ? THEN file_b ELSE file_a END AS other_file, frequency
              FROM cochange WHERE file_a = ? OR file_b = ?
-             ORDER BY frequency DESC LIMIT ?",
+             ORDER BY frequency DESC, recency DESC LIMIT ?",
         )?;
         let rows = stmt.query_map(params![file, file, file, limit], |row| {
             Ok((row.get(0)?, row.get(1)?))
@@ -550,6 +698,7 @@ impl LoomDb {
                 file_a TEXT NOT NULL,
                 file_b TEXT NOT NULL,
                 frequency INTEGER NOT NULL DEFAULT 1,
+                recency REAL NOT NULL DEFAULT 0.0,
                 UNIQUE(file_a, file_b)
             );
             CREATE INDEX IF NOT EXISTS idx_cochange_a ON cochange(file_a);
@@ -558,6 +707,7 @@ impl LoomDb {
         )?;
         self.vector_store
             .create_schema(&conn, self.config.embedding_dimensions)?;
+        migrate_cochange_recency(&conn)?;
         debug!(db_path = %self.db_path.display(), "LoomDb schema initialized");
         Ok(())
     }
@@ -703,4 +853,17 @@ fn checked_sql_limit(limit: usize) -> Result<i64> {
         )));
     }
     i64::try_from(limit).map_err(|_| LoomError::InvalidInput("limit is too large".to_string()))
+}
+
+fn migrate_cochange_recency(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(cochange)")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    let columns = collect_rows(rows)?;
+    if !columns.iter().any(|column| column == "recency") {
+        conn.execute(
+            "ALTER TABLE cochange ADD COLUMN recency REAL NOT NULL DEFAULT 0.0",
+            [],
+        )?;
+    }
+    Ok(())
 }

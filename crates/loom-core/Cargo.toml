@@ -6,13 +6,24 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+crossbeam-channel = "0.5"
+dirs = "6"
+globset = "0.4"
+hf-hub = { version = "0.5", default-features = false, features = ["ureq", "rustls-tls"] }
+ignore = "0.4"
+notify = { version = "8", default-features = true, features = ["crossbeam-channel"] }
 parking_lot = "0.12"
 petgraph = { version = "0.8", features = ["stable_graph", "matrix_graph"] }
 r2d2 = "0.8"
 r2d2_sqlite = "0.34"
+rayon = "1"
 rusqlite = { version = "0.39", features = ["bundled", "functions", "load_extension"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
 thiserror = "2"
+time = { version = "0.3", default-features = false, features = ["formatting", "parsing"] }
+tokenizers = "0.23"
 toml = "0.9"
 tracing = "0.1"
 tree-sitter = "0.25"
@@ -23,6 +34,16 @@ tree-sitter-javascript = "0.25"
 tree-sitter-python = "0.25"
 tree-sitter-rust = "0.24"
 tree-sitter-typescript = "0.23"
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+candle-core = { version = "0.10", default-features = false }
+candle-nn = { version = "0.10", default-features = false }
+candle-transformers = { version = "0.10", default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-core = { version = "0.10", default-features = false, features = ["metal"] }
+candle-nn = { version = "0.10", default-features = false, features = ["metal"] }
+candle-transformers = { version = "0.10", default-features = false, features = ["metal"] }
 
 [dev-dependencies]
 serde_json = "1"

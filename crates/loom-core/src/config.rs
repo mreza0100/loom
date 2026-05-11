@@ -10,6 +10,7 @@ const ALWAYS_EXCLUDED: [&str; 3] = [".git", "__pycache__", ".loom"];
 pub struct LoomConfig {
     pub target_dir: PathBuf,
     pub db_path: PathBuf,
+    pub model_cache_dir: PathBuf,
     pub watch_extensions: BTreeSet<String>,
     pub debounce_seconds: f64,
     pub embedding_model: String,
@@ -27,6 +28,7 @@ pub struct LoomConfig {
 #[derive(Debug, Deserialize)]
 struct PartialConfig {
     db_path: Option<PathBuf>,
+    model_cache_dir: Option<PathBuf>,
     watch_extensions: Option<Vec<String>>,
     debounce_seconds: Option<f64>,
     embedding_model: Option<String>,
@@ -69,8 +71,11 @@ impl LoomConfig {
         Self {
             target_dir: target_dir.into(),
             db_path: PathBuf::from(".loom/loom.db"),
+            model_cache_dir: dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".loom/models"),
             watch_extensions,
-            debounce_seconds: 2.0,
+            debounce_seconds: 0.5,
             embedding_model: "jinaai/jina-embeddings-v2-base-code".to_string(),
             embedding_dimensions: 768,
             max_file_size_bytes: 512_000,
@@ -126,6 +131,9 @@ impl LoomConfig {
     fn apply_partial(&mut self, partial: PartialConfig) {
         if let Some(db_path) = partial.db_path {
             self.db_path = db_path;
+        }
+        if let Some(model_cache_dir) = partial.model_cache_dir {
+            self.model_cache_dir = model_cache_dir;
         }
         if let Some(watch_extensions) = partial.watch_extensions {
             self.watch_extensions = watch_extensions.into_iter().collect();

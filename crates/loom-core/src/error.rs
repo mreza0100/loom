@@ -24,6 +24,32 @@ pub enum LoomError {
     VectorDimension { expected: usize, actual: usize },
     #[error("vector store error: {0}")]
     VectorStore(String),
+    #[error("embedder download failed: {0}")]
+    EmbedderDownload(String),
+    #[error("embedder tokenizer failed: {0}")]
+    EmbedderTokenizer(String),
+    #[error("embedder model failed: {0}")]
+    EmbedderModel(String),
+    #[error("embedder device selection failed: {0}")]
+    EmbedderDevice(String),
+    #[error("embedding dimension mismatch: expected {expected}, got {actual}")]
+    EmbeddingDimension { expected: usize, actual: usize },
+    #[error("indexer IO failed for {path}: {source}")]
+    IndexerIo {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("indexer path error: {0}")]
+    IndexerPath(String),
+    #[error("indexer channel error: {0}")]
+    IndexerChannel(String),
+    #[error("watcher error: {0}")]
+    Watcher(String),
+    #[error("git command failed: {0}")]
+    GitCommand(String),
+    #[error("git parse failed: {0}")]
+    GitParse(String),
     #[error("missing connection: {0}")]
     MissingConnection(String),
     #[error("graph lookup failed: {0}")]
