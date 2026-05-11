@@ -129,10 +129,12 @@ class IndexPipeline:
                     sym.file = rel_path
                     sym_id = self._db.insert_symbol(sym)
                     symbol_ids.append(sym_id)
-                    pending_embeds.append((
-                        sym_id,
-                        self._embedder.build_symbol_text(sym.name, sym.kind, sym.context),
-                    ))
+                    pending_embeds.append(
+                        (
+                            sym_id,
+                            self._embedder.build_symbol_text(sym.name, sym.kind, sym.context),
+                        )
+                    )
 
                 local_name_to_id: dict[str, int] = {
                     sym.name: sym_id for sym, sym_id in zip(symbols, symbol_ids, strict=True)
