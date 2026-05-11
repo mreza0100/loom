@@ -13,6 +13,7 @@ import posixpath
 from pathlib import Path
 
 from loom.config import LoomConfig
+from loom.indexer.adapters import REGISTRY
 from loom.indexer.embedder import Embedder
 from loom.indexer.parser import parse_file
 from loom.store.db import LoomDB
@@ -264,27 +265,25 @@ class IndexPipeline:
 
         import_map: dict[tuple[str, str], tuple[str, str | None]] = {}
         for local_name, source_file, target_file, original_name in rows:
-            resolved = self._resolve_module_file(target_file, known_files)
+            resolved = self._resolve_module_file(target_file, known_files, source_file)
             import_map[(source_file, local_name)] = (resolved, original_name)
         return import_map
 
-    @staticmethod
-    def _resolve_module_file(target_file: str, known_files: set[str]) -> str:
+    def _resolve_module_file(
+        self,
+        target_file: str,
+        known_files: set[str],
+        source_file: str,
+    ) -> str:
         """Resolve a module path to an actual indexed file.
 
-        Tries the path as-is first, then appends common JS/TS extensions,
-        then tries index files. Returns the original path if no match found.
+        Delegates to the adapter registered for source_file's extension.
+        Falls back to returning target_file unchanged if no adapter is found.
         """
-        if target_file in known_files:
-            return target_file
-        for ext in (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"):
-            candidate = target_file + ext
-            if candidate in known_files:
-                return candidate
-        for index in ("index.js", "index.ts"):
-            candidate = f"{target_file}/{index}"
-            if candidate in known_files:
-                return candidate
+        ext = Path(source_file).suffix
+        adapter = REGISTRY.get_adapter(ext)
+        if adapter is not None:
+            return adapter.resolve_module_path(target_file, source_file, known_files)
         return target_file
 
     def _resolve_single_edge(

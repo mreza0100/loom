@@ -14,12 +14,14 @@ from watchdog.events import (
 from watchdog.observers import Observer
 from watchdog.observers.api import BaseObserver
 
+from loom.indexer.adapters import REGISTRY
+
 log = logging.getLogger(__name__)
 
-WATCH_EXTENSIONS = frozenset({".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs"})
-EXCLUDED_DIRS = frozenset(
-    {"node_modules", ".git", "dist", "build", ".next", "coverage", "__pycache__"},
-)
+_ALWAYS_EXCLUDED: frozenset[str] = frozenset({".git", "__pycache__"})
+
+WATCH_EXTENSIONS: frozenset[str] = REGISTRY.get_all_extensions()
+EXCLUDED_DIRS: frozenset[str] = REGISTRY.get_all_excluded_dirs() | _ALWAYS_EXCLUDED
 
 
 def _hash_file(path: Path) -> str:
