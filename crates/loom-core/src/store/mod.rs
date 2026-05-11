@@ -335,8 +335,10 @@ impl LoomDb {
             )?;
         }
         tx.execute(
-            "INSERT OR REPLACE INTO index_meta (file_path, content_hash) VALUES (?, ?)",
-            params![path, content_hash],
+            "INSERT OR REPLACE INTO index_meta
+             (file_path, content_hash, embedding_fingerprint)
+             VALUES (?, ?, ?)",
+            params![path, content_hash, self.config.embedding_fingerprint()],
         )?;
         tx.commit()?;
         Ok((symbols.len(), edges.len()))
@@ -553,6 +555,11 @@ impl LoomDb {
         if self.get_file_hash(path)?.as_deref() != Some(content_hash) {
             return Ok(false);
         }
+        if self.get_embedding_fingerprint(path)?.as_deref()
+            != Some(self.config.embedding_fingerprint().as_str())
+        {
+            return Ok(false);
+        }
         let conn = self.reader()?;
         let symbol_ids = select_symbol_ids_for_file(&conn, path)?;
         if symbol_ids.is_empty() {
@@ -567,10 +574,23 @@ impl LoomDb {
     pub fn set_file_hash(&self, path: &str, content_hash: &str) -> Result<()> {
         let conn = self.writer.lock();
         conn.execute(
-            "INSERT OR REPLACE INTO index_meta (file_path, content_hash) VALUES (?, ?)",
-            params![path, content_hash],
+            "INSERT OR REPLACE INTO index_meta
+             (file_path, content_hash, embedding_fingerprint)
+             VALUES (?, ?, ?)",
+            params![path, content_hash, self.config.embedding_fingerprint()],
         )?;
         Ok(())
+    }
+
+    fn get_embedding_fingerprint(&self, path: &str) -> Result<Option<String>> {
+        let conn = self.reader()?;
+        conn.query_row(
+            "SELECT embedding_fingerprint FROM index_meta WHERE file_path = ?",
+            [path],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(LoomError::from)
     }
 
     pub fn list_symbol_files(&self) -> Result<Vec<String>> {
@@ -668,6 +688,23 @@ impl LoomDb {
                 recency = excluded.recency",
             params![a, b, frequency, recency],
         )?;
+        Ok(())
+    }
+
+    pub fn replace_cochanges(&self, cochanges: &[(String, String, i64, f64)]) -> Result<()> {
+        let mut conn = self.writer.lock();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM cochange", [])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO cochange (file_a, file_b, frequency, recency) VALUES (?, ?, ?, ?)",
+            )?;
+            for (file_a, file_b, frequency, recency) in cochanges {
+                let (a, b) = canonical_pair(file_a, file_b);
+                stmt.execute(params![a, b, frequency, recency])?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 

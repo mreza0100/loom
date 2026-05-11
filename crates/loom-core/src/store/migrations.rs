@@ -1,7 +1,7 @@
 use crate::{error::Result, store::vector::VectorStore};
 use rusqlite::Connection;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 3;
+pub const CURRENT_SCHEMA_VERSION: i64 = 4;
 
 pub fn run_migrations(
     conn: &Connection,
@@ -21,11 +21,16 @@ pub fn run_migrations(
         vector_store.create_schema(conn, dimensions)?;
         set_schema_version(conn, 3)?;
     }
+    if schema_version(conn)? < 4 {
+        ensure_index_meta_embedding_fingerprint(conn)?;
+        set_schema_version(conn, 4)?;
+    }
 
     // Older Rust databases can have user_version = 0 while already carrying
     // current tables. Keep the guards idempotent so opening them upgrades cleanly.
     create_base_schema(conn)?;
     ensure_cochange_recency(conn)?;
+    ensure_index_meta_embedding_fingerprint(conn)?;
     vector_store.create_schema(conn, dimensions)?;
     set_schema_version(conn, CURRENT_SCHEMA_VERSION)?;
     Ok(())
@@ -75,6 +80,7 @@ fn create_base_schema(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS index_meta (
             file_path TEXT PRIMARY KEY,
             content_hash TEXT NOT NULL,
+            embedding_fingerprint TEXT NOT NULL DEFAULT '',
             last_indexed TEXT NOT NULL DEFAULT (datetime('now'))
         );
 
@@ -98,17 +104,33 @@ fn create_base_schema(conn: &Connection) -> Result<()> {
 }
 
 fn ensure_cochange_recency(conn: &Connection) -> Result<()> {
-    let mut stmt = conn.prepare("PRAGMA table_info(cochange)")?;
+    ensure_column(
+        conn,
+        "cochange",
+        "recency",
+        "ALTER TABLE cochange ADD COLUMN recency REAL NOT NULL DEFAULT 0.0",
+    )
+}
+
+fn ensure_index_meta_embedding_fingerprint(conn: &Connection) -> Result<()> {
+    ensure_column(
+        conn,
+        "index_meta",
+        "embedding_fingerprint",
+        "ALTER TABLE index_meta ADD COLUMN embedding_fingerprint TEXT NOT NULL DEFAULT ''",
+    )
+}
+
+fn ensure_column(conn: &Connection, table: &str, column: &str, alter_sql: &str) -> Result<()> {
+    let pragma = format!("PRAGMA table_info({table})");
+    let mut stmt = conn.prepare(&pragma)?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
     let mut columns = Vec::new();
     for row in rows {
         columns.push(row?);
     }
-    if !columns.iter().any(|column| column == "recency") {
-        conn.execute(
-            "ALTER TABLE cochange ADD COLUMN recency REAL NOT NULL DEFAULT 0.0",
-            [],
-        )?;
+    if !columns.iter().any(|existing| existing == column) {
+        conn.execute(alter_sql, [])?;
     }
     Ok(())
 }

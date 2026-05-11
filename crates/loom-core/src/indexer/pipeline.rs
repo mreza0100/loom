@@ -75,14 +75,18 @@ impl<E: Embedder> IndexPipeline<E> {
             );
             if analyzer.is_git_repo()? {
                 let cochanges = analyzer.analyze_cochanges()?;
-                for pair in &cochanges {
-                    self.db.upsert_cochange_with_recency(
-                        &pair.file_a,
-                        &pair.file_b,
-                        pair.frequency,
-                        pair.recency,
-                    )?;
-                }
+                let rows = cochanges
+                    .iter()
+                    .map(|pair| {
+                        (
+                            pair.file_a.clone(),
+                            pair.file_b.clone(),
+                            pair.frequency,
+                            pair.recency,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                self.db.replace_cochanges(&rows)?;
                 result.cochange_pairs = cochanges.len();
             }
         }

@@ -140,7 +140,13 @@ fn old_schema_without_recency_upgrades_idempotently() {
             frequency INTEGER NOT NULL DEFAULT 1,
             UNIQUE(file_a, file_b)
         );
+        CREATE TABLE index_meta (
+            file_path TEXT PRIMARY KEY,
+            content_hash TEXT NOT NULL,
+            last_indexed TEXT NOT NULL DEFAULT (datetime('now'))
+        );
         INSERT INTO cochange (file_a, file_b, frequency) VALUES ('a.py', 'b.py', 3);
+        INSERT INTO index_meta (file_path, content_hash) VALUES ('legacy.py', 'abc');
         ",
     )
     .unwrap();
@@ -151,6 +157,7 @@ fn old_schema_without_recency_upgrades_idempotently() {
     let cochange = db.get_cochange("a.py", "b.py").unwrap().unwrap();
     assert_eq!(cochange.frequency, 3);
     assert_eq!(cochange.recency, 0.0);
+    assert!(!db.file_index_is_fresh("legacy.py", "abc").unwrap());
 
     let reopened = LoomDb::open(LoomConfig::default_for_target(temp.path())).unwrap();
     assert_eq!(reopened.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
@@ -410,6 +417,12 @@ fn cochange_and_stats() {
         Err(LoomError::InvalidInput(_))
     ));
     assert_eq!(db.get_stats().unwrap().cochange_pairs, 2);
+
+    db.replace_cochanges(&[("d.py".to_string(), "a.py".to_string(), 5, 0.2)])
+        .unwrap();
+    assert_eq!(db.get_cochange_frequency("a.py", "b.py").unwrap(), 0);
+    assert_eq!(db.get_cochange_frequency("a.py", "d.py").unwrap(), 5);
+    assert_eq!(db.get_stats().unwrap().cochange_pairs, 1);
 }
 
 #[test]

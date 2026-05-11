@@ -139,6 +139,48 @@ fn full_index_rebuilds_vectors_when_backend_changes() {
 }
 
 #[test]
+fn full_index_rebuilds_vectors_when_embedding_fingerprint_changes() {
+    let dir = tempdir().unwrap();
+    let file = dir.path().join("app.py");
+    fs::write(&file, "def alpha():\n    return 1\n").unwrap();
+    let mut first_config = LoomConfig::default_for_target(dir.path());
+    first_config.embedding_dimensions = 3;
+    first_config.enable_git_analysis = false;
+    first_config.vector_backend = VectorBackendConfig::Blob;
+    let db = Arc::new(LoomDb::open(first_config.clone()).unwrap());
+    let first_pipeline = IndexPipeline::new(
+        first_config,
+        Arc::clone(&db),
+        Arc::new(MockEmbedder { dimensions: 3 }),
+    );
+    assert_eq!(first_pipeline.full_index().unwrap().indexed, 1);
+    assert!(db.file_index_is_fresh("app.py", &walk_hash(&file)).unwrap());
+
+    let mut second_config = LoomConfig::default_for_target(dir.path());
+    second_config.embedding_dimensions = 4;
+    second_config.enable_git_analysis = false;
+    second_config.vector_backend = VectorBackendConfig::Blob;
+    let reopened = Arc::new(LoomDb::open(second_config.clone()).unwrap());
+    assert!(!reopened
+        .file_index_is_fresh("app.py", &walk_hash(&file))
+        .unwrap());
+    let second_pipeline = IndexPipeline::new(
+        second_config,
+        Arc::clone(&reopened),
+        Arc::new(MockEmbedder { dimensions: 4 }),
+    );
+
+    let rebuilt = second_pipeline.full_index().unwrap();
+
+    assert_eq!(rebuilt.indexed, 1);
+    assert_eq!(rebuilt.skipped, 0);
+    assert_eq!(reopened.get_stats().unwrap().vectors, 1);
+    assert!(reopened
+        .file_index_is_fresh("app.py", &walk_hash(&file))
+        .unwrap());
+}
+
+#[test]
 fn incremental_delete_removes_symbols_vectors_and_hash() {
     let dir = tempdir().unwrap();
     let file = dir.path().join("app.py");

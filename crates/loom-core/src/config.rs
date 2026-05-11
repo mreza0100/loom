@@ -168,6 +168,18 @@ impl LoomConfig {
         Ok(resolved)
     }
 
+    #[must_use]
+    pub fn embedding_fingerprint(&self) -> String {
+        format!(
+            "vector={};embedder={};model={};dims={};fallback={}",
+            self.vector_backend.as_str(),
+            self.embedding_backend.as_str(),
+            self.embedding_model,
+            self.embedding_dimensions,
+            self.allow_hashing_embedder_fallback
+        )
+    }
+
     fn apply_partial(&mut self, partial: PartialConfig) {
         if let Some(db_path) = partial.db_path {
             self.db_path = db_path;
