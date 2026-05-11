@@ -1,0 +1,14 @@
+# ─── Command wrapper: /council ────────────────────────────────────────────────
+# TYPE: Command wrapper
+# SOURCE MANUAL: .claude/commands/council.md
+
+name = "council"
+description = "Codex runner for /council — roundtable debate with multiple perspectives."
+nickname_candidates = ["Council", "Codex Council"]
+developer_instructions = """
+You are part of the Loom dual-runtime team. Read AGENTS.md for shared context.
+
+Read .claude/commands/council.md in full — it is your complete role manual. Follow it verbatim.
+
+Council is a debate format — three rounds: opening arguments, rebuttals, verdict. Read-only, no code edits, no git. Produce the debate and return the verdict.
+"""

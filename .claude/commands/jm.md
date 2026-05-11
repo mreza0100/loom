@@ -41,7 +41,7 @@ issues, or evolve the .claude infrastructure, you handle it.
 | **Pipeline flow** | "add linting step before QA" | build.md, CLAUDE.md |
 | **Conventions** | "switch to ruff format" | CLAUDE.md, agents |
 | **New command** | "add /deploy" | new command, CLAUDE.md |
-| **Script fix** | "worktree.sh fails" | scripts |
+| **Script fix** | "dev.sh fails" | scripts |
 | **Character** | "JC feels off" | jc.md character section |
 
 ### Step 2 — Audit impact
@@ -51,7 +51,6 @@ Read all affected files. Grep for references across `.claude/`, `CLAUDE.md`.
 **Consistency check:**
 - Agent frontmatter matches behavior
 - Agent `tools` list matches needs
-- `worktree.sh` matches actual setup
 - `/build` references match agent names
 - Test commands in agents match actual runners
 - Character voices intact
@@ -61,7 +60,7 @@ Read all affected files. Grep for references across `.claude/`, `CLAUDE.md`.
 
 **Rules:**
 - Preserve YAML frontmatter format
-- Keep path variables (`$DOCS`, `$DOCS_REL`, etc.)
+- Keep path variables (`$DOCS`, etc.)
 - Character section is non-negotiable
 
 ### Step 5 — Verify consistency
@@ -105,7 +104,7 @@ If `$ARGUMENTS` is exactly `audit`, run ALL checks. If it contains a scope (e.g.
 | `commands` | Command file existence, CLAUDE.md command table sync |
 | `scripts` | Script existence, references, executable permissions |
 | `pipeline` | Pipeline flow consistency between CLAUDE.md and build.md |
-| `paths` | Path variable usage — no hardcoded doc/worktree paths in agents |
+| `paths` | Path variable usage — no hardcoded doc paths in agents |
 | `tech` | Tech stack descriptions match actual manifests |
 | `structure` | Directory names, repo structure accuracy |
 | `character` | Character voices intact (no sanitization or drift) |
@@ -259,7 +258,7 @@ Manual review needed: [anything requiring attention]
 - **Never break the pipeline** — if a change could break `/build`, make all related edits atomically
 - **Never weaken non-negotiable rules** — ethics, privacy, code quality, and process rules are sacred
 - **Never weaken character voices** — Jungche / JC / Professor / Council voices are non-negotiable
-- **Never remove safety checks** — QA gates, merge guards, and worktree isolation exist for good reasons
+- **Never remove safety checks** — QA gates and merge guards exist for good reasons
 - **Sync across files** — a change in one place must be reflected everywhere
 - **Always research before writing** — when adding technical content, use a research agent first. Never write from training data alone.
 - **Never hardcode names that change with features** — table names, enum values, route paths change as the codebase evolves. Tell agents WHERE to discover these, not what they are.

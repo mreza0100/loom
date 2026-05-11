@@ -3,17 +3,17 @@
 Run the full Loom pipeline for: $ARGUMENTS
 
 **All feature requests MUST go through this pipeline.** No cowboy coding.
-**Autonomous execution: once started, `/build` runs to completion. The only stop points are: pre-flight failure and Fix Loop Escalation → BLOCKED-DEFERRED.**
+**Autonomous execution: once started, `/build` runs to completion. The only stop points are: pre-flight failure and Fix Loop Escalation -> BLOCKED-DEFERRED.**
 
 ---
 
 ## Pre-flight — validate before starting
 
-Check `$ARGUMENTS` for coherence. If too vague → stop with diagnostic. Do NOT proceed.
+Check `$ARGUMENTS` for coherence. If too vague -> stop with diagnostic. Do NOT proceed.
 
 ---
 
-## Step 0 — Name the pipeline, clean up stale dirs
+## Step 0 — Name the pipeline
 
 ### 0a. Stale pipeline cleanup
 
@@ -21,16 +21,18 @@ Check `$ARGUMENTS` for coherence. If too vague → stop with diagnostic. Do NOT 
 for dir in docs/dev/tasks/*/; do
   name=$(basename "$dir")
   [ "$name" = "archive" ] && continue
-  if [ ! -d ".worktrees/$name" ]; then
-    echo "STALE: $dir (no active worktree)"
+  if [ -f "$dir/BLOCKED.md" ]; then
+    echo "BLOCKED: $dir (preserved for /jc)"
+  elif [ -f "$dir/7-post-merge-qa.md" ]; then
+    echo "ARCHIVABLE: $dir"
   fi
 done
 ```
 
 For each stale dir:
-- Has `BLOCKED.md` → SKIP (preserved for `/jc`)
-- Has `7-post-merge-qa.md` → archive it
-- Otherwise → archive with `ABANDONED.md` marker
+- Has `BLOCKED.md` -> SKIP (preserved for `/jc`)
+- Has `7-post-merge-qa.md` -> archive it
+- Otherwise -> archive with `ABANDONED.md` marker
 
 ### 0b. Name the pipeline
 
@@ -41,20 +43,17 @@ For each stale dir:
 **Name uniqueness check (standalone only — skip when `[Pipeline: ...]` is present):** Before proceeding, verify the chosen name does NOT already exist in:
 - `docs/dev/tasks/archive/` — archived pipelines
 - `docs/dev/tasks/` — active pipelines
-- `.worktrees/` — active worktrees
 
 ```bash
-ls docs/dev/tasks/archive/ docs/dev/tasks/ .worktrees/ 2>/dev/null | grep -x "{name}"
+ls docs/dev/tasks/archive/ docs/dev/tasks/ 2>/dev/null | grep -x "{name}"
 ```
 
 If the name exists, append a version suffix (e.g., `search-improvements-v2`) or choose a more specific name. **NEVER reuse an archived pipeline name** — it causes doc conflicts and breaks traceability.
 
 Resolve path variables:
 - **`$PIPELINE`** = `{name}` — the pipeline name (kebab-case, unique across active + archived). Extracted from `[Pipeline: {name}]` in `$ARGUMENTS` when present (wave-invoked), otherwise chosen by build (standalone).
-- **`$WAVE`** = wave name extracted from `[Wave: {wave-name}]` in `$ARGUMENTS`, otherwise `none`. This value is forwarded to gitter so merge + docs commits carry a `Wave:` trailer for git-history traceability back to `docs/dev/waves/archive/{wave}/`.
-- **`$DOCS`** = `docs/dev/tasks/{name}` — pipeline docs from repo root
-- **`$DOCS_REL`** = `../../docs/dev/tasks/{name}` — pipeline docs from worktree
-- **`$WORKTREE`** = `.worktrees/{name}` — pipeline worktree directory
+- **`$WAVE`** = wave name extracted from `[Wave: {wave-name}]` in `$ARGUMENTS`, otherwise `none`. This value is forwarded to gitter so commits carry a `Wave:` trailer for git-history traceability back to `docs/dev/waves/archive/{wave}/`.
+- **`$DOCS`** = `docs/dev/tasks/{name}` — pipeline docs
 - **`$ARCHIVE`** = `docs/dev/tasks/archive` — archive parent directory
 
 ```bash
@@ -65,8 +64,8 @@ mkdir -p docs/dev/tasks/{name}
 ```bash
 [ -f docs/dev/tasks/{name}/0-task.md ] && echo "manifest exists — wave pre-placed it" || echo "manifest missing — standalone build"
 ```
-- **Exists** → read it as-is, do NOT overwrite. Wave wrote the pipeline-specific task spec here.
-- **Missing** (standalone build only) → write it now:
+- **Exists** -> read it as-is, do NOT overwrite. Wave wrote the pipeline-specific task spec here.
+- **Missing** (standalone build only) -> write it now:
   ```markdown
   # Task: {name}
 
@@ -75,7 +74,7 @@ mkdir -p docs/dev/tasks/{name}
   Wave: {$WAVE or none}
   ```
 
-**Pass `$PIPELINE`, `$DOCS`, `$DOCS_REL`, and `$WORKTREE` to every agent invocation.** Agents should never hardcode doc or worktree paths — they use what you give them.
+**Pass `$PIPELINE` and `$DOCS` to every agent invocation.** Agents should never hardcode doc paths — they use what you give them.
 
 ---
 
@@ -93,15 +92,7 @@ Wait for completion. Read the plan.
 
 ---
 
-## Step 2 — Git Setup (worktree + ports)
-
-Use the `gitter` agent in **SETUP** phase. **Model: sonnet.**
-- "Pipeline: {name}. Phase: SETUP."
-- Creates worktree at `.worktrees/{name}`
-
----
-
-## Step 3 — Architecture
+## Step 2 — Architecture
 
 Spawn the architect agent. **Model: sonnet.**
 
@@ -116,33 +107,31 @@ Agent(general-purpose, model: "sonnet"): "You are the Loom architect. Read and f
 
 ---
 
-## Step 4 — Development (on worktree)
+## Step 3 — Development
 
-Read ports from `$DOCS/ports.md`, then launch developer. **Model: sonnet.**
+Launch developer. **Model: sonnet.**
 
 ```
 Agent(general-purpose, model: "sonnet"): "You are the Loom developer. Read and follow .claude/agents/developer.md.
 
   Pipeline: {name}.
-  Worktree: $WORKTREE. Branch: pipeline/{name}.
-  ALL pipeline docs from worktree: $DOCS_REL/.
-  Write dev report to $DOCS_REL/5-dev-report.md.
+  ALL pipeline docs: $DOCS/.
+  Write dev report to $DOCS/5-dev-report.md.
   NEVER run git commands."
 ```
 
 ---
 
-## Step 5 — QA (BEFORE merge)
+## Step 4 — QA
 
-**CRITICAL: QA runs against the worktree, NOT main.**
+**CRITICAL: QA runs against `src/loom/` on main.**
 
 ```
 Agent(general-purpose, model: "sonnet"): "You are the Loom QA engineer. Read and follow .claude/agents/qa.md.
 
-  Mode: PRE-MERGE. Pipeline: {name}.
-  Worktree: $WORKTREE.
-  ALL pipeline docs from worktree: $DOCS_REL/.
-  Write bug report to $DOCS_REL/6-bugs.md."
+  Pipeline: {name}.
+  ALL pipeline docs: $DOCS/.
+  Write bug report to $DOCS/6-bugs.md."
 ```
 
 ---
@@ -151,7 +140,7 @@ Agent(general-purpose, model: "sonnet"): "You are the Loom QA engineer. Read and
 
 If `$DOCS/6-bugs.md` has `Status: OPEN`:
 
-1. **Developer fixes** — spawn developer on worktree, reads `6-bugs.md`
+1. **Developer fixes** — spawn developer, reads `6-bugs.md`
 2. **Re-run QA**
 3. Repeat until `Status: NONE` OR 3 iterations OR escalation trigger
 
@@ -160,35 +149,34 @@ If `$DOCS/6-bugs.md` has `Status: OPEN`:
 When: iteration cap reached, hung test, same bug returns, sub-agent orphan.
 
 1. Write `$DOCS/BLOCKED.md` with root cause, state preserved info, resume protocol
-2. Do NOT delete worktree or release ports
-3. Return BLOCKED-DEFERRED to user
+2. Return BLOCKED-DEFERRED to user
 
 ---
 
-## Step 6 — Git Merge
+## Step 5 — Commit
 
 Use `gitter` in **MERGE** phase. **Model: sonnet.**
 - "Pipeline: {name}. Wave: {$WAVE or 'none'}. Phase: MERGE."
 
 ---
 
-## Step 7 — Post-Merge QA (on main)
+## Step 6 — Post-Commit QA (on main)
 
 ```
 Agent(general-purpose, model: "sonnet"): "You are the Loom QA engineer. Read and follow .claude/agents/qa.md.
 
-  Mode: POST-MERGE. Pipeline: {name}. Run against src/loom/ on main.
+  Pipeline: {name}. Run against src/loom/ on main.
   Pipeline docs: $DOCS/.
   Return results inline."
 ```
 
 Write `$DOCS/7-post-merge-qa.md`.
 
-If post-merge QA fails, spawn a fix pipeline `{name}-postmerge-fix`.
+If post-commit QA fails, spawn a fix pipeline `{name}-postfix`.
 
 ---
 
-## Step 8 — Pipeline Audit
+## Step 7 — Pipeline Audit
 
 ```
 Agent(general-purpose, model: "sonnet"): "You are the code auditor. Read and follow .claude/commands/ca.md.
@@ -201,7 +189,7 @@ Write `$DOCS/8-audit.md`. If BLOCKING findings, spawn fix pipeline.
 
 ---
 
-## Step 9 — Commit Docs
+## Step 8 — Commit Docs
 
 Use `gitter` in **DOCS-COMMIT** phase. **Model: sonnet.**
 - "Pipeline: {name}. Wave: {$WAVE or 'none'}. Phase: DOCS-COMMIT."
@@ -213,15 +201,14 @@ Use `gitter` in **DOCS-COMMIT** phase. **Model: sonnet.**
 | # | Step | Who | Produces |
 |---|------|-----|----------|
 | 1 | Analysis | planner | `$DOCS/1-plan.md` |
-| 2 | Git setup | gitter (SETUP) | Worktree, ports, `$DOCS/ports.md` |
-| 3 | Architecture | architect | `$DOCS/3-architecture.md` |
-| 4 | Develop | developer | Code in worktree + `$DOCS/5-dev-report.md` |
-| 5 | QA | qa | Tests + `$DOCS/6-bugs.md` |
-| - | Fix loop | developer → qa | Repeat until NONE |
-| 6 | Merge | gitter (MERGE) | Commits + merges to main |
-| 7 | Post-merge QA | qa (POST-MERGE) | `$DOCS/7-post-merge-qa.md` |
-| 8 | Audit | code auditor | `$DOCS/8-audit.md` |
-| 9 | Commit docs | gitter (DOCS-COMMIT) | Commits doc changes |
+| 2 | Architecture | architect | `$DOCS/3-architecture.md` |
+| 3 | Develop | developer | Code + `$DOCS/5-dev-report.md` |
+| 4 | QA | qa | Tests + `$DOCS/6-bugs.md` |
+| - | Fix loop | developer -> qa | Repeat until NONE |
+| 5 | Commit | gitter (MERGE) | Commits on main |
+| 6 | Post-commit QA | qa | `$DOCS/7-post-merge-qa.md` |
+| 7 | Audit | code auditor | `$DOCS/8-audit.md` |
+| 8 | Commit docs | gitter (DOCS-COMMIT) | Commits doc changes |
 
 ---
 

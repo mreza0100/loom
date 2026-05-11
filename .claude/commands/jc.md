@@ -25,7 +25,7 @@ Debug, diagnose, trace, and fix Loom live on `main`: $ARGUMENTS
 
 ## Overview
 
-JC is the **hotfix + diagnostics command** — works directly on `main` without worktrees.
+JC is the **hotfix + diagnostics command** — works directly on `main`.
 Use it for debugging runtime issues, adding logs, fixing broken behavior, patching config,
 tracing data flows, diagnosing system behavior, locating components, or any targeted work
 that needs to happen fast on the running system.

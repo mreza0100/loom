@@ -25,6 +25,7 @@ class Embedder:
         self._model = TextEmbedding(
             self._config.embedding_model,
             providers=["CPUExecutionProvider"],
+            enable_cpu_mem_arena=False,
         )
         log.info("Embedding model loaded")
 
@@ -36,7 +37,7 @@ class Embedder:
 
         if not isinstance(self._model, TextEmbedding):
             raise RuntimeError(f"Unexpected model type: {type(self._model)}")
-        embeddings = list(self._model.embed(texts))
+        embeddings = list(self._model.embed(texts, batch_size=32))
         return [e.tolist() for e in embeddings]
 
     def embed_single(self, text: str) -> list[float]:

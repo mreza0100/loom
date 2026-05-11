@@ -1,0 +1,52 @@
+# Loom Codex integration layer.
+#
+# Configures OpenAI's Codex CLI to mirror the .claude/ pipeline.
+# The existing markdown command/agent docs remain read-only source manuals;
+# these settings expose the runtime primitives Codex actually understands.
+#
+# OPTIONAL — everything works without this. Delete the entire .codex/ directory
+# if you don't use Codex, and the pipeline runs fine on Claude Code alone.
+
+# ─── Voice ───────────────────────────────────────────────────────────────────
+# Disable Codex's generic personality layer. Jungche owns voice through
+# AGENTS.md, skills, and archetype-specific agents (JC, Professor, Council).
+personality = "none"
+
+# ─── Limits ──────────────────────────────────────────────────────────────────
+# Max bytes Codex will read from AGENTS.md (symlink to CLAUDE.md).
+# Increase if your CLAUDE.md exceeds 64KB — Codex silently truncates beyond this.
+project_doc_max_bytes = 65536
+
+# ─── Approval & sandbox ─────────────────────────────────────────────────────
+# "never" = full auto-approve (Codex runs without human confirmation).
+# Change to "on-failure" or "always" if you want a human gate.
+approval_policy = "never"
+
+# "danger-full-access" = no filesystem sandbox. Required for worktree.sh,
+# port allocation, git operations, and infrastructure commands.
+sandbox_mode = "danger-full-access"
+
+[features]
+# Disable the generic personality selector so Jungche archetypes own voice.
+personality = false
+# Enable Codex hook system (pre/post task hooks).
+hooks = true
+
+[agents]
+# Max parallel Codex Teams child agents. Loom is single-project so 4 is fine.
+max_threads = 4
+# Depth of agent nesting. 1 = orchestrator spawns children, children can't nest.
+max_depth = 1
+# Hard timeout per agent job (seconds). 1800 = 30 minutes.
+job_max_runtime_seconds = 1800
+
+[shell_environment_policy]
+# "core" = inherit PATH, HOME, USER, SHELL and nothing else.
+inherit = "core"
+
+[shell_environment_policy.set]
+# Enable Codex Teams — allows Agent() spawning from .codex/agents/*.toml.
+CODEX_EXPERIMENTAL_AGENT_TEAMS = "1"
+
+# ─── Loom-specific env vars ─────────────────────────────────────────────────
+# PYTHON_PATH = "./src"

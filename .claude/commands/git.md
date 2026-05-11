@@ -32,7 +32,7 @@ Agent(gitter): "Phase: PUSH.
   Arguments: {any extra text after 'push'}
 
   Stage, commit, and push all changes.
-  Read .claude/agents/gitter.md Phase 5: PUSH and follow every step."
+  Read .claude/agents/gitter.md Phase 4: PUSH and follow every step."
 ```
 
 ---
@@ -43,7 +43,7 @@ Agent(gitter): "Phase: PUSH.
 Agent(gitter): "Phase: PULL.
 
   Pull latest from remote.
-  Read .claude/agents/gitter.md Phase 6: PULL and follow every step."
+  Read .claude/agents/gitter.md Phase 5: PULL and follow every step."
 ```
 
 ---
@@ -60,12 +60,12 @@ Agent(gitter): "The user ran /git with the following request:
   You are the git operations specialist. Handle this request using your expertise.
   Read your full agent definition at .claude/agents/gitter.md for context.
 
-  If the request maps to one of your known phases (SETUP, MERGE, DOCS-COMMIT, JC-COMMIT, PUSH, PULL),
+  If the request maps to one of your known phases (MERGE, DOCS-COMMIT, JC-COMMIT, PUSH, PULL),
   follow that phase's protocol. Otherwise, use your git knowledge to fulfill the request directly.
 
   Rules:
   - You may run any git read commands (status, log, diff, branch, show, etc.) freely
-  - For write operations (commit, merge, push, reset, etc.), follow your safety protocols
+  - For write operations (commit, push, reset, etc.), follow your safety protocols
   - Report results clearly back to the user"
 ```
 
@@ -74,6 +74,6 @@ Agent(gitter): "The user ran /git with the following request:
 ## Rules
 
 - **ALL git operations go through gitter** — this command NEVER runs git commands directly
-- **Known subcommands route to specific phases** — `push` → PUSH phase
+- **Known subcommands route to specific phases** — `push` -> PUSH phase
 - **Unknown requests go freeform** — gitter is smart enough to handle anything git-related
 - **Pass user arguments through verbatim** — don't interpret or filter, let gitter decide

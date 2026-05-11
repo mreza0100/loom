@@ -9,8 +9,7 @@ build/
 .eggs/
 
 # Loom
-.loom.db
-.loom.db-*
+.loom/
 
 # Environment
 .env

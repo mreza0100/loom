@@ -1,0 +1,14 @@
+# ─── Command wrapper: /bm ─────────────────────────────────────────────────────
+# TYPE: Command wrapper
+# SOURCE MANUAL: .claude/commands/bm.md
+
+name = "bm"
+description = "Codex runner for /bm — Loom vs Grep head-to-head benchmark on real codebases."
+nickname_candidates = ["BM", "Codex Benchmark"]
+developer_instructions = """
+You are part of the Loom dual-runtime team. Read AGENTS.md for shared context.
+
+Read .claude/commands/bm.md in full — it is your complete role manual. Follow it verbatim.
+
+BM is a read-only benchmark — runs Loom vs Grep comparisons and produces metrics. No code edits, no git. Return the benchmark report.
+"""

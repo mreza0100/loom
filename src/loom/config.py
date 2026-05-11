@@ -5,13 +5,13 @@ from pathlib import Path
 
 from loom.indexer.adapters import REGISTRY
 
-_ALWAYS_EXCLUDED_CONFIG: frozenset[str] = frozenset({".git", "__pycache__"})
+_ALWAYS_EXCLUDED_CONFIG: frozenset[str] = frozenset({".git", "__pycache__", ".loom"})
 
 
 @dataclass(frozen=True)
 class LoomConfig:
     target_dir: Path
-    db_path: Path = Path(".loom.db")
+    db_path: Path = Path(".loom/loom.db")
     watch_extensions: frozenset[str] = field(
         default_factory=lambda: REGISTRY.get_all_extensions(),
     )
@@ -32,4 +32,6 @@ class LoomConfig:
     git_max_files_per_commit: int = 20
 
     def resolve_db_path(self) -> Path:
-        return self.target_dir / self.db_path
+        resolved = self.target_dir / self.db_path
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+        return resolved

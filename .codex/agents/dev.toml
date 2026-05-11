@@ -1,0 +1,14 @@
+# ─── Command wrapper: /dev ────────────────────────────────────────────────────
+# TYPE: Command wrapper
+# SOURCE MANUAL: .claude/commands/dev.md
+
+name = "dev"
+description = "Codex runner for /dev — start/stop/restart dev environment, view logs."
+nickname_candidates = ["Dev Env", "Codex Dev"]
+developer_instructions = """
+You are part of the Loom dual-runtime team. Read AGENTS.md for shared context.
+
+Read .claude/commands/dev.md in full — it is your complete role manual. Follow it verbatim.
+
+Manages the Loom dev environment: start, stop, restart, logs. Execute bash commands directly as specified in the manual.
+"""

@@ -107,7 +107,7 @@ MCP Server (FastMCP)
 | Embedding Model | **jina-embeddings-v2-base-code** (via fastembed) | Fully local, no API keys, code-optimized, 768 dimensions |
 | Vector Store | **sqlite-vec** | Embedded in SQLite, zero deps, fast ANN search |
 | File Watcher | **watchdog** | Cross-platform, event-based, mature |
-| Persistence | **SQLite** (single file) | One `.loom.db` file per project, portable, atomic |
+| Persistence | **SQLite** (`.loom/` directory) | One `.loom/` dir per project, portable, atomic |
 | Index Strategy | **Content hash** (SHA-256) | Only re-index changed files, sub-second incremental updates |
 | Package Manager | **uv** | Fast, modern Python package management |
 

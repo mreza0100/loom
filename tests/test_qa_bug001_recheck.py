@@ -25,7 +25,7 @@ from tests.conftest import make_js_file
 
 def _mock_embedder() -> MagicMock:
     e = MagicMock()
-    e.embed.return_value = [[0.1] * 768]
+    e.embed.side_effect = lambda texts: [[0.1] * 768 for _ in texts]
     e.embed_single.return_value = [0.1] * 768
     e.build_symbol_text.return_value = "fn\ncode"
     return e

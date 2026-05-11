@@ -18,7 +18,7 @@ from loom.indexer.adapters import REGISTRY
 
 log = logging.getLogger(__name__)
 
-_ALWAYS_EXCLUDED: frozenset[str] = frozenset({".git", "__pycache__"})
+_ALWAYS_EXCLUDED: frozenset[str] = frozenset({".git", "__pycache__", ".loom"})
 
 WATCH_EXTENSIONS: frozenset[str] = REGISTRY.get_all_extensions()
 EXCLUDED_DIRS: frozenset[str] = REGISTRY.get_all_excluded_dirs() | _ALWAYS_EXCLUDED

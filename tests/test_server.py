@@ -230,7 +230,7 @@ class TestServerTools:
             "stale_files": 0,
         }
         server_module._config.target_dir = Path("/tmp/project")  # noqa: S108
-        server_module._config.resolve_db_path.return_value = Path("/tmp/project/.loom.db")  # noqa: S108
+        server_module._config.resolve_db_path.return_value = Path("/tmp/project/.loom/loom.db")  # noqa: S108
         result = status()
         assert result["symbols"] == 100
         assert "target" in result

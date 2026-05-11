@@ -102,11 +102,13 @@ class IndexPipeline:
         return result
 
     def _parse_all_files(self, files: list[Path]) -> dict[str, int]:
-        """Phase 1: parse each file, store symbols + raw edges (target_id=NULL)."""
+        """Phase 1: parse files, store symbols + edges. Phase 1b: batch-embed all symbols."""
         total_symbols = 0
         total_edges = 0
         indexed = 0
+        pending_embeds: list[tuple[int, str]] = []
 
+        # Phase 1a: parse all files, store symbols + edges (no embeddings yet)
         for path in files:
             try:
                 rel_path = str(path.relative_to(self._config.target_dir))
@@ -122,60 +124,42 @@ class IndexPipeline:
                 symbols, parsed_edges = parse_file(path, source)
 
                 symbol_ids: list[int] = []
-                embed_texts: list[str] = []
 
                 for sym in symbols:
                     sym.file = rel_path
                     sym_id = self._db.insert_symbol(sym)
                     symbol_ids.append(sym_id)
-                    embed_texts.append(
+                    pending_embeds.append((
+                        sym_id,
                         self._embedder.build_symbol_text(sym.name, sym.kind, sym.context),
-                    )
+                    ))
 
-                if embed_texts:
-                    embeddings = self._embedder.embed(embed_texts)
-                    for sym_id, emb in zip(symbol_ids, embeddings, strict=True):
-                        self._db.insert_embedding(sym_id, emb)
-
-                # Build local name-to-id map (source is always in same file for non-import edges)
                 local_name_to_id: dict[str, int] = {
                     sym.name: sym_id for sym, sym_id in zip(symbols, symbol_ids, strict=True)
                 }
-                # File anchor: any symbol from this file — used for import edges whose
-                # local binding name is not itself a declared symbol
                 file_anchor_id: int | None = symbol_ids[0] if symbol_ids else None
 
-                # Convert ParsedEdge -> Edge (source_id resolved, target_id=None)
                 for parsed in parsed_edges:
-                    # For import edges: local_name (source_name) is the imported binding,
-                    # not a declared symbol. Use a file anchor symbol as source_id.
-                    # Store target_name=local_name so _build_import_map can use it as key.
                     if parsed.relationship == "imports":
                         if file_anchor_id is None:
-                            # No symbols in file — can't anchor import edge, skip
                             continue
                         target_file = parsed.target_file
                         if target_file and target_file.startswith("."):
                             target_file = _resolve_import_path(target_file, rel_path)
-                        # target_name = LOCAL name (the binding used in code calls)
-                        # _build_import_map key: (file, local_name) -> target_file
-                        # original_name = exported name in target (differs for aliased imports)
                         local_name = parsed.source_name
                         exported_name = parsed.target_name
                         edge = Edge(
                             source_id=file_anchor_id,
-                            target_name=local_name,  # local binding name (import map key)
+                            target_name=local_name,
                             target_file=target_file,
                             relationship="imports",
                             confidence=0.0,
                             target_id=None,
-                            # Store original exported name only when it differs from local alias
                             original_name=exported_name if exported_name != local_name else None,
                         )
                         self._db.insert_edge(edge)
                         continue
 
-                    # Non-import edges: source_name is always a declared symbol in this file
                     source_id = local_name_to_id.get(parsed.source_name)
                     if source_id is None:
                         log.debug(
@@ -200,17 +184,51 @@ class IndexPipeline:
                 total_symbols += len(symbols)
                 total_edges += len(parsed_edges)
                 indexed += 1
-                log.info(
-                    "Indexed %s: %d symbols, %d edges",
-                    rel_path,
-                    len(symbols),
-                    len(parsed_edges),
-                )
+
+                if indexed % 500 == 0:
+                    self._db.commit()
+                    log.info(
+                        "Parsed %d/%d files, %d symbols, %d edges",
+                        indexed,
+                        len(files),
+                        total_symbols,
+                        total_edges,
+                    )
 
             except Exception:
                 log.exception("Failed to index %s", path)
 
         self._db.commit()
+        log.info(
+            "Parse complete: %d files, %d symbols, %d edges. Starting batch embed...",
+            indexed,
+            total_symbols,
+            total_edges,
+        )
+
+        # Phase 1b: batch-embed in small chunks to cap memory (~500MB peak)
+        if pending_embeds:
+            total_to_embed = len(pending_embeds)
+            log.info("Embedding %d symbols...", total_to_embed)
+            chunk_size = 500
+            for i in range(0, total_to_embed, chunk_size):
+                chunk = pending_embeds[i : i + chunk_size]
+                chunk_ids = [sid for sid, _ in chunk]
+                chunk_texts = [txt for _, txt in chunk]
+                chunk_embeddings = self._embedder.embed(chunk_texts)
+                for sym_id, emb in zip(chunk_ids, chunk_embeddings, strict=True):
+                    self._db.insert_embedding(sym_id, emb)
+                self._db.commit()
+                embedded_count = min(i + chunk_size, total_to_embed)
+                log.info(
+                    "Embedded %d/%d symbols (%.0f%%)",
+                    embedded_count,
+                    total_to_embed,
+                    embedded_count / total_to_embed * 100,
+                )
+                del chunk, chunk_ids, chunk_texts, chunk_embeddings
+            del pending_embeds
+            log.info("Embedding complete: %d vectors stored", total_to_embed)
 
         log.info(
             "Parse-all complete: %d files, %d symbols, %d edges",

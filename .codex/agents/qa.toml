@@ -1,0 +1,14 @@
+# ─── Command wrapper: /qa ─────────────────────────────────────────────────────
+# TYPE: Command wrapper
+# SOURCE MANUAL: .claude/commands/qa.md
+
+name = "qa"
+description = "Codex runner for /qa — adversarial dogfood of Loom MCP tools with structured report."
+nickname_candidates = ["QA Dogfood", "Codex QA Dogfood"]
+developer_instructions = """
+You are part of the Loom dual-runtime team. Read AGENTS.md for shared context.
+
+Read .claude/commands/qa.md in full — it is your complete role manual. Follow it verbatim.
+
+QA dogfood runs real dev tasks against Loom's MCP tools and produces a structured report. No git operations — report only.
+"""

@@ -66,7 +66,7 @@ class TestIndexPipeline:
     @pytest.fixture
     def mock_embedder(self) -> MagicMock:
         embedder = MagicMock()
-        embedder.embed.return_value = [[0.1] * 768]
+        embedder.embed.side_effect = lambda texts: [[0.1] * 768 for _ in texts]
         embedder.build_symbol_text.return_value = "function test\ncode"
         return embedder
 
@@ -80,7 +80,7 @@ class TestIndexPipeline:
         make_js_file(tmp_dir, "src/app.js", "function main() { helper(); }\nfunction helper() {}")
         pipeline = IndexPipeline(config, db, mock_embedder)
 
-        mock_embedder.embed.return_value = [[0.1] * 768, [0.2] * 768]
+        mock_embedder.embed.side_effect = lambda texts: [[0.1] * 768 for _ in texts]
         result = pipeline.full_index()
 
         assert result["indexed"] == 1
@@ -115,7 +115,7 @@ class TestIndexPipeline:
 
         pipeline.full_index()
         f.write_text("function main() {}\nfunction extra() {}")
-        mock_embedder.embed.return_value = [[0.1] * 768, [0.2] * 768]
+        mock_embedder.embed.side_effect = lambda texts: [[0.1] * 768 for _ in texts]
 
         result = pipeline.full_index()
         assert result["indexed"] == 1
@@ -188,7 +188,7 @@ class TestTwoPhaseIndexing:
     @pytest.fixture
     def mock_embedder(self) -> MagicMock:
         embedder = MagicMock()
-        embedder.embed.return_value = [[0.1] * 768, [0.2] * 768]
+        embedder.embed.side_effect = lambda texts: [[0.1] * 768 for _ in texts]
         embedder.build_symbol_text.return_value = "function test\ncode"
         return embedder
 
@@ -211,7 +211,7 @@ class TestTwoPhaseIndexing:
         """Two files: A calls B. After full_index, edge should be resolved."""
         make_js_file(tmp_dir, "a.js", "function a() { b(); }")
         make_js_file(tmp_dir, "b.js", "function b() {}")
-        mock_embedder.embed.return_value = [[0.1] * 768]
+        mock_embedder.embed.side_effect = lambda texts: [[0.1] * 768 for _ in texts]
 
         pipeline = self._make_pipeline(tmp_dir, config, db, mock_embedder)
         result = pipeline.full_index()
@@ -252,7 +252,7 @@ class TestTwoPhaseIndexing:
             "import { b } from './b.js';\nfunction a() { b(); }",
         )
         make_js_file(tmp_dir, "src/b.js", "export function b() {}")
-        mock_embedder.embed.return_value = [[0.1] * 768]
+        mock_embedder.embed.side_effect = lambda texts: [[0.1] * 768 for _ in texts]
 
         pipeline = self._make_pipeline(tmp_dir, config, db, mock_embedder)
         result = pipeline.full_index()
@@ -286,7 +286,7 @@ class TestTwoPhaseIndexing:
         """Unique name match (strategy 5) at confidence 0.6."""
         make_js_file(tmp_dir, "caller.js", "function caller() { _makePathsRelative(); }")
         make_js_file(tmp_dir, "util.js", "function _makePathsRelative() { return '/'; }")
-        mock_embedder.embed.return_value = [[0.1] * 768]
+        mock_embedder.embed.side_effect = lambda texts: [[0.1] * 768 for _ in texts]
 
         pipeline = self._make_pipeline(tmp_dir, config, db, mock_embedder)
         pipeline.full_index()
@@ -319,7 +319,7 @@ class TestTwoPhaseIndexing:
         make_js_file(tmp_dir, "a.js", "function run() { create(); }")
         make_js_file(tmp_dir, "b.js", "function create() { return 1; }")
         make_js_file(tmp_dir, "c.js", "function create() { return 2; }")
-        mock_embedder.embed.return_value = [[0.1] * 768]
+        mock_embedder.embed.side_effect = lambda texts: [[0.1] * 768 for _ in texts]
 
         pipeline = self._make_pipeline(tmp_dir, config, db, mock_embedder)
         pipeline.full_index()
@@ -356,7 +356,7 @@ class TestTwoPhaseIndexing:
         )
         make_js_file(tmp_dir, "imported.js", "export function importedFunc() {}")
 
-        mock_embedder.embed.return_value = [[0.1] * 768]
+        mock_embedder.embed.side_effect = lambda texts: [[0.1] * 768 for _ in texts]
         pipeline = self._make_pipeline(tmp_dir, config, db, mock_embedder)
         pipeline.full_index()
 
@@ -390,7 +390,7 @@ class TestTwoPhaseIndexing:
     ) -> None:
         """Index A (b() unresolved), then add B defining b. Re-index resolves edge."""
         a_file = make_js_file(tmp_dir, "a.js", "function a() { uniquelyNamedFunc(); }")
-        mock_embedder.embed.return_value = [[0.1] * 768]
+        mock_embedder.embed.side_effect = lambda texts: [[0.1] * 768 for _ in texts]
 
         pipeline = self._make_pipeline(tmp_dir, config, db, mock_embedder)
 
@@ -431,7 +431,7 @@ class TestTwoPhaseIndexing:
         """Delete file B after resolving edge A->B. Edge should become unresolved."""
         make_js_file(tmp_dir, "a.js", "function a() { b(); }")
         b_file = make_js_file(tmp_dir, "b.js", "function b() {}")
-        mock_embedder.embed.return_value = [[0.1] * 768]
+        mock_embedder.embed.side_effect = lambda texts: [[0.1] * 768 for _ in texts]
 
         pipeline = self._make_pipeline(tmp_dir, config, db, mock_embedder)
 
