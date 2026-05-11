@@ -16,4 +16,15 @@
 - [x] `adapter-arch` — **DONE** — feat commit cc24ae0, docs commit ca59f13. 619 tests, 91.25% coverage. Audit: no blocking issues.
 
 ### Wave 2 — Language Adapters
-- [ ] `lang-adapters` — Python, Go, Java, Rust, C# adapters + registry __init__.py (6 tasks)
+- [x] `lang-adapters` — **DONE** — feat commit 9572b32, docs commit c282bc4. 855 tests, 91.79% coverage. Audit: no blocking issues, 2 HIGH (Java reverse edges — recommended /jc).
+
+## Final Summary
+
+**Completed:** 2026-05-11 | **Pipelines:** 2 succeeded, 0 failed, 0 deferred
+
+| Pipeline | Tasks | Status | Notes |
+|----------|-------|--------|-------|
+| `adapter-arch` | 4 | DONE | LanguageAdapter Protocol + JS refactor + pipeline awareness + deps |
+| `lang-adapters` | 6 | DONE | Python, Go, Java, Rust, C# adapters + registry |
+
+**Total:** 9 tasks → 2 pipelines → 855 tests → 91.79% coverage
