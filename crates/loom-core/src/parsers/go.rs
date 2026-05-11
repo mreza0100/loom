@@ -97,7 +97,7 @@ fn walk_node(node: Node<'_>, source: &[u8], file_path: &str, result: &mut ParseR
             return;
         }
         "const_declaration" | "var_declaration" => {
-            for identifier in identifiers_under(node, source) {
+            for identifier in declared_identifiers_under(node, source) {
                 result.symbols.push(symbol(
                     source, node, file_path, "go", identifier, "variable",
                 ));
@@ -181,11 +181,16 @@ fn handle_type_declaration(
     }
 }
 
-fn identifiers_under(node: Node<'_>, source: &[u8]) -> Vec<String> {
+fn declared_identifiers_under(node: Node<'_>, source: &[u8]) -> Vec<String> {
     let mut names = Vec::new();
     walk_preorder(node, &mut |candidate| {
-        if matches!(candidate.kind(), "identifier" | "type_identifier") {
-            names.push(text(source, candidate));
+        if matches!(candidate.kind(), "const_spec" | "var_spec") {
+            let mut cursor = candidate.walk();
+            for child in candidate.named_children(&mut cursor) {
+                if child.kind() == "identifier" {
+                    names.push(text(source, child));
+                }
+            }
         }
     });
     names

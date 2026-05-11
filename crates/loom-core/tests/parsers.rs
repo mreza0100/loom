@@ -1,6 +1,6 @@
 use std::{collections::BTreeSet, fs};
 
-use loom_core::{parse_file, AdapterRegistry, ParseResult};
+use loom_core::{parsers::parse_file, AdapterRegistry, ParseResult};
 use tempfile::tempdir;
 
 fn names(result: &ParseResult) -> BTreeSet<String> {

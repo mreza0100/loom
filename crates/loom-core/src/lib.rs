@@ -7,4 +7,4 @@ pub mod store;
 
 pub use config::LoomConfig;
 pub use error::{LoomError, Result};
-pub use parsers::{parse_file, AdapterRegistry, LanguageAdapter, ParseResult};
+pub use parsers::{AdapterRegistry, LanguageAdapter, ParseResult};

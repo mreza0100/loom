@@ -212,11 +212,7 @@ fn handle_bases(node: Node<'_>, source: &[u8], name: &str, result: &mut ParseRes
         ) {
             let target = text(source, candidate);
             if !matches!(target.as_str(), ":" | ",") {
-                let relationship = if target.starts_with('I') {
-                    "implements"
-                } else {
-                    "extends"
-                };
+                let relationship = "extends";
                 result
                     .edges
                     .push(edge(name, target.clone(), relationship, None));

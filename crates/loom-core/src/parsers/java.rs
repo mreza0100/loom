@@ -186,10 +186,10 @@ fn handle_bases(node: Node<'_>, source: &[u8], name: &str, result: &mut ParseRes
                     "type_identifier" | "identifier" | "scoped_type_identifier"
                 ) {
                     let target = text(source, candidate);
-                    let relationship = if base_group.contains("interface") {
-                        "implements"
-                    } else {
-                        "extends"
+                    let relationship = match base_group {
+                        "super_interfaces" | "interfaces" => "implements",
+                        "superclass" | "extends_interfaces" => "extends",
+                        _ => "extends",
                     };
                     result
                         .edges

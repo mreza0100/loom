@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use loom_core::{parse_file, AdapterRegistry, ParseResult};
+use loom_core::{parsers::parse_file, AdapterRegistry, ParseResult};
 
 fn symbol_names(result: &ParseResult) -> BTreeSet<String> {
     result
@@ -137,4 +137,126 @@ fn qa_cross_language_empty_and_comment_only_sources_are_empty() {
             "{path} should not emit symbols from empty/comment-only source"
         );
     }
+}
+
+#[test]
+fn qa_java_interface_extends_uses_extends_not_implements() {
+    let registry = AdapterRegistry::with_builtin_adapters();
+    let source = br#"
+interface Parent {}
+interface Child extends Parent {}
+"#;
+
+    let result = parse_file(
+        std::path::Path::new("Interfaces.java"),
+        Some(source),
+        &registry,
+    )
+    .expect("parse");
+
+    assert!(
+        result.edges.iter().any(|edge| {
+            edge.relationship == "extends"
+                && edge.source_name == "Child"
+                && edge.target_name == "Parent"
+        }),
+        "Java interface inheritance should use extends"
+    );
+    assert!(
+        !result.edges.iter().any(|edge| {
+            edge.relationship == "implements"
+                && edge.source_name == "Child"
+                && edge.target_name == "Parent"
+        }),
+        "Java interface extends must not be mislabeled as implements"
+    );
+}
+
+#[test]
+fn qa_go_typed_var_does_not_emit_type_as_variable() {
+    let registry = AdapterRegistry::with_builtin_adapters();
+    let source = br#"
+package main
+type Client struct {}
+var client Client
+const answer int = 42
+"#;
+
+    let result =
+        parse_file(std::path::Path::new("main.go"), Some(source), &registry).expect("parse");
+
+    assert!(result
+        .symbols
+        .iter()
+        .any(|symbol| symbol.kind == "variable" && symbol.name == "client"));
+    assert!(result
+        .symbols
+        .iter()
+        .any(|symbol| symbol.kind == "variable" && symbol.name == "answer"));
+    assert!(
+        !result
+            .symbols
+            .iter()
+            .any(|symbol| symbol.kind == "variable" && symbol.name == "Client"),
+        "typed var declaration should not index the type name as a variable"
+    );
+}
+
+#[test]
+fn qa_csharp_base_list_defaults_to_extends_without_name_heuristic() {
+    let registry = AdapterRegistry::with_builtin_adapters();
+    let source = br#"
+class InvoiceBase {}
+class Invoice : InvoiceBase {}
+class Worker : IRunnable {}
+"#;
+
+    let result =
+        parse_file(std::path::Path::new("Invoice.cs"), Some(source), &registry).expect("parse");
+
+    assert!(
+        result.edges.iter().any(|edge| {
+            edge.relationship == "extends"
+                && edge.source_name == "Invoice"
+                && edge.target_name == "InvoiceBase"
+        }),
+        "C# base class should be extends"
+    );
+    assert!(
+        result.edges.iter().any(|edge| {
+            edge.relationship == "extends"
+                && edge.source_name == "Worker"
+                && edge.target_name == "IRunnable"
+        }),
+        "C# parser should not use an I-prefix heuristic for implements"
+    );
+}
+
+#[test]
+fn qa_javascript_class_fields_are_variables_not_methods() {
+    let registry = AdapterRegistry::with_builtin_adapters();
+    let source = br#"
+class Widget {
+  count = 0;
+  render() { return this.count; }
+}
+"#;
+
+    let result =
+        parse_file(std::path::Path::new("widget.js"), Some(source), &registry).expect("parse");
+
+    assert!(
+        result
+            .symbols
+            .iter()
+            .any(|symbol| symbol.kind == "variable" && symbol.name == "Widget.count"),
+        "class field should be indexed as a variable"
+    );
+    assert!(
+        !result
+            .symbols
+            .iter()
+            .any(|symbol| symbol.kind == "method" && symbol.name == "Widget.count"),
+        "class field must not be mislabeled as a method"
+    );
 }

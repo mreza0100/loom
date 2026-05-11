@@ -144,7 +144,7 @@ fn walk_node(
             }
             return;
         }
-        "method_definition" | "method_signature" | "public_field_definition" => {
+        "method_definition" | "method_signature" => {
             if let Some(container) = scope.container {
                 if let Some(name_node) = child_by_field(node, "name").or_else(|| {
                     first_named_child_of_kind(
@@ -167,6 +167,26 @@ fn walk_node(
                     ));
                     push_call_edges(node, source, &name, &mut result.edges, &["console."]);
                     push_instantiates(node, source, &name, &mut result.edges);
+                }
+            }
+            return;
+        }
+        "public_field_definition" | "field_definition" => {
+            if let Some(container) = scope.container {
+                if let Some(name_node) = child_by_field(node, "name").or_else(|| {
+                    first_named_child_of_kind(
+                        node,
+                        &[
+                            "property_identifier",
+                            "identifier",
+                            "private_property_identifier",
+                        ],
+                    )
+                }) {
+                    let name = qualified(Some(container), &text(source, name_node));
+                    result
+                        .symbols
+                        .push(symbol(source, node, file_path, language, name, "variable"));
                 }
             }
             return;
