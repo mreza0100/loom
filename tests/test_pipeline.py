@@ -26,10 +26,10 @@ class TestShouldIndex:
         f.write_text("const x = 1;")
         assert _should_index(f, config) is True
 
-    def test_py_file_rejected(self, config: LoomConfig, tmp_dir: Path) -> None:
+    def test_py_file_accepted(self, config: LoomConfig, tmp_dir: Path) -> None:
         f = tmp_dir / "app.py"
         f.write_text("x = 1")
-        assert _should_index(f, config) is False
+        assert _should_index(f, config) is True
 
     def test_node_modules_excluded(self, config: LoomConfig, tmp_dir: Path) -> None:
         d = tmp_dir / "node_modules" / "pkg"

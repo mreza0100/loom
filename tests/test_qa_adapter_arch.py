@@ -597,8 +597,8 @@ class TestPipelineResolveModuleFileFallback:
         )
         result = pipeline._resolve_module_file(
             "some/target/module",
-            {"some/target/module.py"},
-            "src/main.py",  # .py has no registered adapter
+            {"some/target/module.xyz"},
+            "src/main.xyz",  # .xyz has no registered adapter
         )
         # Must return unchanged — no adapter, no modification
         assert result == "some/target/module"
@@ -764,14 +764,14 @@ class TestRegressions:
         f.write_text("const x = 1;")
         assert _should_index(f, config) is True
 
-    def test_should_index_rejects_python_file(self, tmp_path: Path) -> None:
+    def test_should_index_accepts_python_file(self, tmp_path: Path) -> None:
         from loom.config import LoomConfig
         from loom.indexer.pipeline import _should_index
 
         config = LoomConfig(target_dir=tmp_path)
         f = tmp_path / "main.py"
         f.write_text("def foo(): pass")
-        assert _should_index(f, config) is False
+        assert _should_index(f, config) is True
 
     def test_is_excluded_does_not_false_positive_src(self) -> None:
         from loom.indexer.watcher import _is_excluded

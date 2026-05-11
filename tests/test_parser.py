@@ -336,7 +336,8 @@ class TestEdgeCases:
         assert symbols == []
 
     def test_unsupported_extension(self) -> None:
-        symbols, edges = parse_file(Path("test.py"), source=b"def foo(): pass")
+        # .xyz is genuinely unregistered — no adapter for it
+        symbols, edges = parse_file(Path("test.xyz"), source=b"some content")
         assert symbols == []
         assert edges == []
 
