@@ -7,7 +7,9 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tracing::error;
 
@@ -42,29 +44,28 @@ where
 
 pub struct LoomWatcher {
     _watcher: RecommendedWatcher,
+    _flush_thread: JoinHandle<()>,
 }
 
 impl LoomWatcher {
     pub fn start(config: LoomConfig, handler: Arc<dyn ChangeHandler>) -> Result<Self> {
         let root = config.target_dir.clone();
         let debouncer = Arc::new(Mutex::new(Debouncer::new(config, handler)?));
-        let mut watcher =
-            notify::recommended_watcher(move |event: notify::Result<Event>| match event {
-                Ok(event) => {
-                    let debounce_delay = match debouncer.lock() {
-                        Ok(mut guard) => {
-                            guard.handle_event(event);
-                            guard.debounce_duration()
-                        }
+        let (flush_sender, flush_receiver) = mpsc::channel::<()>();
+        let debouncer_for_flush = Arc::clone(&debouncer);
+        let flush_thread = std::thread::spawn(move || {
+            while flush_receiver.recv().is_ok() {
+                loop {
+                    let debounce_delay = match debouncer_for_flush.lock() {
+                        Ok(guard) => guard.debounce_duration(),
                         Err(source) => {
                             error!(error = %source, "watcher debouncer lock poisoned");
-                            return;
+                            break;
                         }
                     };
-                    let debouncer_for_flush = Arc::clone(&debouncer);
-                    std::thread::spawn(move || {
-                        std::thread::sleep(debounce_delay);
-                        match debouncer_for_flush.lock() {
+                    match flush_receiver.recv_timeout(debounce_delay) {
+                        Ok(()) => continue,
+                        Err(mpsc::RecvTimeoutError::Timeout) => match debouncer_for_flush.lock() {
                             Ok(mut guard) => {
                                 if guard.should_flush(Instant::now()) {
                                     guard.flush();
@@ -73,8 +74,28 @@ impl LoomWatcher {
                             Err(source) => {
                                 error!(error = %source, "watcher debouncer lock poisoned");
                             }
+                        },
+                        Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                    }
+                    break;
+                }
+            }
+        });
+        let mut watcher =
+            notify::recommended_watcher(move |event: notify::Result<Event>| match event {
+                Ok(event) => {
+                    match debouncer.lock() {
+                        Ok(mut guard) => {
+                            guard.handle_event(event);
                         }
-                    });
+                        Err(source) => {
+                            error!(error = %source, "watcher debouncer lock poisoned");
+                            return;
+                        }
+                    };
+                    if flush_sender.send(()).is_err() {
+                        error!("watcher debounce worker closed");
+                    }
                 }
                 Err(source) => {
                     error!(error = %source, "file watcher event failed");
@@ -84,7 +105,10 @@ impl LoomWatcher {
         watcher
             .watch(&root, RecursiveMode::Recursive)
             .map_err(|source| LoomError::Watcher(source.to_string()))?;
-        Ok(Self { _watcher: watcher })
+        Ok(Self {
+            _watcher: watcher,
+            _flush_thread: flush_thread,
+        })
     }
 }
 

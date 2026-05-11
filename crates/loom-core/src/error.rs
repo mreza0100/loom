@@ -42,16 +42,10 @@ pub enum LoomError {
     },
     #[error("indexer path error: {0}")]
     IndexerPath(String),
-    #[error("indexer channel error: {0}")]
-    IndexerChannel(String),
     #[error("watcher error: {0}")]
     Watcher(String),
     #[error("git command failed: {0}")]
     GitCommand(String),
-    #[error("git parse failed: {0}")]
-    GitParse(String),
-    #[error("missing connection: {0}")]
-    MissingConnection(String),
     #[error("graph lookup failed: {0}")]
     GraphLookup(String),
     #[error("invalid input: {0}")]

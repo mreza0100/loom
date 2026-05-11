@@ -54,6 +54,50 @@ fn full_index_indexes_changed_files_and_skips_unchanged_files() {
 }
 
 #[test]
+fn full_index_removes_stale_deleted_files() {
+    let dir = tempdir().unwrap();
+    let file = dir.path().join("app.py");
+    fs::write(&file, "def alpha():\n    return 1\n").unwrap();
+    let mut config = LoomConfig::default_for_target(dir.path());
+    config.embedding_dimensions = 3;
+    config.enable_git_analysis = false;
+    let db = Arc::new(LoomDb::open(config.clone()).unwrap());
+    let pipeline = IndexPipeline::new(
+        config,
+        Arc::clone(&db),
+        Arc::new(MockEmbedder { dimensions: 3 }),
+    );
+    pipeline.full_index().unwrap();
+    fs::remove_file(&file).unwrap();
+
+    let result = pipeline.full_index().unwrap();
+    assert_eq!(result.deleted, 1);
+    assert_eq!(db.get_stats().unwrap().symbols, 0);
+    assert!(db.get_file_hash("app.py").unwrap().is_none());
+}
+
+#[test]
+fn full_index_handles_more_files_than_old_parser_channel_bound() {
+    let dir = tempdir().unwrap();
+    for index in 0..80 {
+        fs::write(
+            dir.path().join(format!("module_{index}.py")),
+            format!("def symbol_{index}():\n    return {index}\n"),
+        )
+        .unwrap();
+    }
+    let mut config = LoomConfig::default_for_target(dir.path());
+    config.embedding_dimensions = 3;
+    config.enable_git_analysis = false;
+    let db = Arc::new(LoomDb::open(config.clone()).unwrap());
+    let pipeline = IndexPipeline::new(config, db, Arc::new(MockEmbedder { dimensions: 3 }));
+
+    let result = pipeline.full_index().unwrap();
+    assert_eq!(result.indexed, 80);
+    assert_eq!(result.symbols, 80);
+}
+
+#[test]
 fn incremental_delete_removes_symbols_vectors_and_hash() {
     let dir = tempdir().unwrap();
     let file = dir.path().join("app.py");
@@ -76,6 +120,28 @@ fn incremental_delete_removes_symbols_vectors_and_hash() {
     assert_eq!(stats.symbols, 0);
     assert_eq!(stats.vectors, 0);
     assert!(db.get_file_hash("app.py").unwrap().is_none());
+}
+
+#[test]
+fn incremental_index_rejects_relative_path_escape() {
+    let dir = tempdir().unwrap();
+    let target = dir.path().join("target");
+    fs::create_dir(&target).unwrap();
+    fs::write(
+        dir.path().join("outside.py"),
+        "def outside():\n    return 1\n",
+    )
+    .unwrap();
+    let mut config = LoomConfig::default_for_target(&target);
+    config.embedding_dimensions = 3;
+    config.enable_git_analysis = false;
+    let db = Arc::new(LoomDb::open(config.clone()).unwrap());
+    let pipeline = IndexPipeline::new(config, db, Arc::new(MockEmbedder { dimensions: 3 }));
+
+    let error = pipeline
+        .incremental_index([std::path::PathBuf::from("../outside.py")])
+        .unwrap_err();
+    assert!(matches!(error, LoomError::IndexerPath(_)));
 }
 
 #[derive(Debug)]

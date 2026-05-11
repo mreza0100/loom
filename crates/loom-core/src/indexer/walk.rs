@@ -4,13 +4,6 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileJob {
-    pub absolute_path: PathBuf,
-    pub db_path: String,
-    pub content_hash: String,
-}
-
 pub fn hash_file(path: &std::path::Path) -> Result<String> {
     let bytes = fs::read(path).map_err(|source| crate::error::LoomError::IndexerIo {
         path: path.display().to_string(),

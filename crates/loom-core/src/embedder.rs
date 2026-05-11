@@ -4,10 +4,12 @@ use candle_nn::{Module, VarBuilder};
 use candle_transformers::models::jina_bert::{BertModel, Config, DTYPE};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokenizers::utils::truncation::{TruncationDirection, TruncationParams, TruncationStrategy};
 use tokenizers::Tokenizer;
 use tracing::warn;
 
 const REQUIRED_MODEL_FILES: [&str; 3] = ["config.json", "tokenizer.json", "model.safetensors"];
+const MAX_TOKEN_LENGTH: usize = 8_192;
 
 pub trait Embedder: Send + Sync {
     fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
@@ -138,8 +140,16 @@ impl<S: ModelSource> Embedder for CandleEmbedder<S> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-        let encodings = self
-            .tokenizer
+        let mut tokenizer = self.tokenizer.clone();
+        tokenizer
+            .with_truncation(Some(TruncationParams {
+                max_length: MAX_TOKEN_LENGTH,
+                strategy: TruncationStrategy::LongestFirst,
+                stride: 0,
+                direction: TruncationDirection::Right,
+            }))
+            .map_err(|source| LoomError::EmbedderTokenizer(source.to_string()))?;
+        let encodings = tokenizer
             .encode_batch(texts.to_vec(), true)
             .map_err(|source| LoomError::EmbedderTokenizer(source.to_string()))?;
         let max_len = encodings

@@ -17,12 +17,11 @@ petgraph = { version = "0.8", features = ["stable_graph", "matrix_graph"] }
 r2d2 = "0.8"
 r2d2_sqlite = "0.34"
 rayon = "1"
-rusqlite = { version = "0.39", features = ["bundled", "functions", "load_extension"] }
+rusqlite = { version = "0.39", features = ["bundled", "functions"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
-time = { version = "0.3", default-features = false, features = ["formatting", "parsing"] }
 tokenizers = "0.23"
 toml = "0.9"
 tracing = "0.1"

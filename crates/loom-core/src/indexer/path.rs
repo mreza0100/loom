@@ -2,14 +2,29 @@ use crate::{config::LoomConfig, error::LoomError, Result};
 use std::path::{Component, Path, PathBuf};
 
 pub fn db_path_for(path: &Path, config: &LoomConfig) -> Result<String> {
-    let relative = path.strip_prefix(&config.target_dir).map_err(|_| {
+    let target_dir = config
+        .target_dir
+        .canonicalize()
+        .map_err(|source| LoomError::IndexerIo {
+            path: config.target_dir.display().to_string(),
+            source,
+        })?;
+    let candidate = canonical_candidate(path)?;
+    let relative = candidate.strip_prefix(&target_dir).map_err(|_| {
         LoomError::IndexerPath(format!(
             "{} is outside target dir {}",
             path.display(),
-            config.target_dir.display()
+            target_dir.display()
         ))
     })?;
-    Ok(normalize_path(relative))
+    let normalized = normalize_path(relative);
+    if normalized.is_empty() || normalized.split('/').any(|part| part == "..") {
+        return Err(LoomError::IndexerPath(format!(
+            "{} does not resolve to an indexable file path",
+            path.display()
+        )));
+    }
+    Ok(normalized)
 }
 
 pub fn normalize_path(path: &Path) -> String {
@@ -77,4 +92,26 @@ pub fn absolute_path(path: PathBuf, config: &LoomConfig) -> PathBuf {
     } else {
         config.target_dir.join(path)
     }
+}
+
+fn canonical_candidate(path: &Path) -> Result<PathBuf> {
+    if path.exists() {
+        return path.canonicalize().map_err(|source| LoomError::IndexerIo {
+            path: path.display().to_string(),
+            source,
+        });
+    }
+    let parent = path.parent().ok_or_else(|| {
+        LoomError::IndexerPath(format!("{} has no parent directory", path.display()))
+    })?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| LoomError::IndexerPath(format!("{} has no file name", path.display())))?;
+    let parent = parent
+        .canonicalize()
+        .map_err(|source| LoomError::IndexerIo {
+            path: parent.display().to_string(),
+            source,
+        })?;
+    Ok(parent.join(file_name))
 }

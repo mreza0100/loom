@@ -222,6 +222,97 @@ impl LoomDb {
         Ok(())
     }
 
+    pub fn replace_file_index<F>(
+        &self,
+        path: &str,
+        content_hash: &str,
+        symbols: &[Symbol],
+        embeddings: &[Vec<f32>],
+        build_edges: F,
+    ) -> Result<(usize, usize)>
+    where
+        F: FnOnce(&[i64]) -> Result<Vec<Edge>>,
+    {
+        if embeddings.len() != symbols.len() {
+            return Err(LoomError::EmbedderModel(format!(
+                "embedder returned {} vectors for {} symbols",
+                embeddings.len(),
+                symbols.len()
+            )));
+        }
+
+        let mut conn = self.writer.lock();
+        let tx = conn.transaction()?;
+        remove_file_in_transaction(&tx, &*self.vector_store, path)?;
+
+        let mut symbol_ids = Vec::with_capacity(symbols.len());
+        {
+            let mut symbol_stmt = tx.prepare(
+                "INSERT INTO symbols (name, kind, file, line, end_line, language, context)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )?;
+            let mut fts_stmt = tx.prepare(
+                "INSERT INTO symbols_fts (rowid, name, kind, file, context)
+                 VALUES (?, ?, ?, ?, ?)",
+            )?;
+            for symbol in symbols {
+                symbol_stmt.execute(params![
+                    symbol.name,
+                    symbol.kind,
+                    symbol.file,
+                    symbol.line,
+                    symbol.end_line,
+                    symbol.language,
+                    symbol.context
+                ])?;
+                let symbol_id = tx.last_insert_rowid();
+                fts_stmt.execute(params![
+                    symbol_id,
+                    symbol.name,
+                    symbol.kind,
+                    symbol.file,
+                    symbol.context
+                ])?;
+                symbol_ids.push(symbol_id);
+            }
+        }
+
+        let edges = build_edges(&symbol_ids)?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO edges
+                 (source_id, target_id, target_name, target_file, relationship, confidence, original_name)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )?;
+            for edge in &edges {
+                stmt.execute(params![
+                    edge.source_id,
+                    edge.target_id,
+                    edge.target_name,
+                    edge.target_file,
+                    edge.relationship,
+                    edge.confidence,
+                    edge.original_name
+                ])?;
+            }
+        }
+
+        for (symbol_id, embedding) in symbol_ids.iter().zip(embeddings.iter()) {
+            self.vector_store.insert_embedding(
+                &tx,
+                *symbol_id,
+                embedding,
+                self.config.embedding_dimensions,
+            )?;
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO index_meta (file_path, content_hash) VALUES (?, ?)",
+            params![path, content_hash],
+        )?;
+        tx.commit()?;
+        Ok((symbols.len(), edges.len()))
+    }
+
     pub fn search_fts(&self, query: &str, limit: usize) -> Result<Vec<Symbol>> {
         let sanitized = sanitize_fts_query(query);
         if sanitized.is_empty() || limit == 0 {
@@ -339,24 +430,7 @@ impl LoomDb {
     pub fn remove_file(&self, path: &str) -> Result<()> {
         let mut conn = self.writer.lock();
         let tx = conn.transaction()?;
-        tx.execute(
-            "UPDATE edges SET target_id = NULL, confidence = 0.0
-             WHERE target_id IN (SELECT id FROM symbols WHERE file = ?)",
-            [path],
-        )?;
-        let symbol_ids = select_symbol_ids_for_file(&tx, path)?;
-        if !symbol_ids.is_empty() {
-            self.vector_store.delete_embeddings(&tx, &symbol_ids)?;
-            let placeholders = repeat_placeholders(symbol_ids.len());
-            let sql = format!("DELETE FROM symbols_fts WHERE rowid IN ({placeholders})");
-            tx.execute(&sql, params_from_iter(symbol_ids.iter()))?;
-        }
-        tx.execute("DELETE FROM symbols WHERE file = ?", [path])?;
-        tx.execute("DELETE FROM index_meta WHERE file_path = ?", [path])?;
-        tx.execute(
-            "DELETE FROM cochange WHERE file_a = ? OR file_b = ?",
-            params![path, path],
-        )?;
+        remove_file_in_transaction(&tx, &*self.vector_store, path)?;
         tx.commit()?;
         Ok(())
     }
@@ -455,24 +529,16 @@ impl LoomDb {
         Ok(())
     }
 
-    pub fn set_file_hashes(&self, hashes: &[(String, String)]) -> Result<()> {
-        let mut conn = self.writer.lock();
-        let tx = conn.transaction()?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT OR REPLACE INTO index_meta (file_path, content_hash) VALUES (?, ?)",
-            )?;
-            for (path, content_hash) in hashes {
-                stmt.execute(params![path, content_hash])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
     pub fn list_symbol_files(&self) -> Result<Vec<String>> {
         let conn = self.reader()?;
         let mut stmt = conn.prepare("SELECT DISTINCT file FROM symbols ORDER BY file")?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        collect_rows(rows)
+    }
+
+    pub fn list_indexed_files(&self) -> Result<Vec<String>> {
+        let conn = self.reader()?;
+        let mut stmt = conn.prepare("SELECT file_path FROM index_meta ORDER BY file_path")?;
         let rows = stmt.query_map([], |row| row.get(0))?;
         collect_rows(rows)
     }
@@ -822,6 +888,32 @@ fn select_symbol_ids_for_file(conn: &Connection, path: &str) -> Result<Vec<i64>>
     let mut stmt = conn.prepare("SELECT id FROM symbols WHERE file = ?")?;
     let rows = stmt.query_map([path], |row| row.get(0))?;
     collect_rows(rows)
+}
+
+fn remove_file_in_transaction(
+    conn: &Connection,
+    vector_store: &dyn VectorStore,
+    path: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE edges SET target_id = NULL, confidence = 0.0
+         WHERE target_id IN (SELECT id FROM symbols WHERE file = ?)",
+        [path],
+    )?;
+    let symbol_ids = select_symbol_ids_for_file(conn, path)?;
+    if !symbol_ids.is_empty() {
+        vector_store.delete_embeddings(conn, &symbol_ids)?;
+        let placeholders = repeat_placeholders(symbol_ids.len());
+        let sql = format!("DELETE FROM symbols_fts WHERE rowid IN ({placeholders})");
+        conn.execute(&sql, params_from_iter(symbol_ids.iter()))?;
+    }
+    conn.execute("DELETE FROM symbols WHERE file = ?", [path])?;
+    conn.execute("DELETE FROM index_meta WHERE file_path = ?", [path])?;
+    conn.execute(
+        "DELETE FROM cochange WHERE file_a = ? OR file_b = ?",
+        params![path, path],
+    )?;
+    Ok(())
 }
 
 fn filter_file_suffix(symbols: Vec<Symbol>, file: &str) -> Vec<Symbol> {
