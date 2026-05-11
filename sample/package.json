@@ -1,7 +1,0 @@
-{
-  "name": "loom-sample-store",
-  "version": "1.0.0",
-  "description": "Sample e-commerce app for Loom indexing",
-  "main": "src/index.js",
-  "type": "module"
-}

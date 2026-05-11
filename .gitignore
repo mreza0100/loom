@@ -30,9 +30,19 @@ Thumbs.db
 
 # Dev
 tmp/
+sample/
 *.log
 
-# Worktrees
+# Tool caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+
+# MCP config (contains absolute paths — see README for setup)
+.mcp.json
+
+# Worktrees (legacy)
 .worktrees/
 
 # uv

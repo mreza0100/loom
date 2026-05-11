@@ -165,14 +165,13 @@ The north star metric: **useful symbols discovered per token spent.** Everything
 
 ## Development Workflow
 
-- **New features → `/build`** — full pipeline with worktrees, QA gates, and merge guards. No cowboy coding.
-- **Bug fixes → `/jc`** — diagnose, fix, test, commit on `main`. Targeted fixes only.
+All development happens directly on `main`.
+
+- **New features → `/build`** — plan, implement, QA, commit.
+- **Bug fixes → `/jc`** — diagnose, fix, test, commit. Targeted fixes only.
 - **Cross-disciplinary analysis → `/professor`** — PhDs in Information Retrieval, Graph Theory, Systems Architecture, Developer Experience.
 - **Pipeline evolution → `/jm`** — surgical edits to the pipeline at the source.
 - **Benchmarking → `/bm`** — head-to-head Loom vs Grep on real open-source projects.
-- **Never edit code directly on `main`** without going through `/build` or `/jc`.
-
-Both `/build` and `/jc` handle worktree isolation, port allocation, and git operations automatically via gitter.
 
 ---
 
@@ -186,11 +185,8 @@ Both `/build` and `/jc` handle worktree isolation, port allocation, and git oper
 - Generated artifacts go in `tmp/`, never `docs/`
 
 ### Process
-- **NEVER edit code on `main`** — worktree branches only, merged by gitter after QA
-- **Only gitter commits code** — no other agent runs git commands
-- **NEVER commit broken code / merge before QA passes**
+- **NEVER commit broken code** — all tests must pass before committing
 - **NEVER run destructive git** — no `reset --hard`, `push --force`, `clean -fdx`, `rm -rf`
-- **NEVER reuse archived pipeline names** — check archives, append `-v2` if collision
 - Never install unvalidated libraries; never commit secrets
 - **Parallelize multi-task work** — when given multiple independent tasks, investigate all upfront, then spawn independent agents. Think dispatch, not loop.
 
@@ -228,13 +224,12 @@ loom/
 ├── .claude/
 │   ├── agents/            ← gitter, planner, architect, developer, qa
 │   ├── commands/          ← /build, /jc, /jm, /dev, /git, /professor, /ca
-│   ├── scripts/           ← worktree.sh, alloc-ports.sh, dev.sh
+│   ├── scripts/           ← dev.sh
 │   └── skills/            ← rr, rnd
 ├── docs/
 │   ├── agents/            ← permanent project docs
 │   ├── commands/{cmd}/    ← command-owned docs ($CDOCS)
 │   └── dev/               ← pipeline tasks, research
-└── .worktrees/            ← git worktree checkouts (gitignored)
 ```
 
 ### Doc Path Variables
@@ -252,7 +247,7 @@ loom/
 
 | Agent | Role |
 |-------|------|
-| **gitter** | Single git operator — SETUP, MERGE, DOCS-COMMIT, JC-COMMIT, PUSH, PULL |
+| **gitter** | Single git operator — commits, pushes, pulls |
 | **planner** | Codebase analysis + task planning |
 | **architect** | Project architecture + library research |
 | **developer** | Implementation + self-QA |
@@ -264,7 +259,7 @@ All agents in `.claude/agents/`.
 
 | Command | Purpose |
 |---------|---------|
-| `/build` | Full dev pipeline — worktrees, QA gates, merge |
+| `/build` | Full dev pipeline — plan, implement, QA, commit |
 | `/jc` | Debug, diagnose, fix on `main` |
 | `/jm` | Update .claude infrastructure |
 | `/dev` | Start/stop/restart dev environment, logs |
