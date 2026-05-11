@@ -11,7 +11,9 @@ pub mod store;
 pub mod watcher;
 
 pub use config::LoomConfig;
-pub use embedder::{build_symbol_text, CandleEmbedder, Embedder, ModelSource};
+pub use embedder::{
+    build_symbol_text, CandleEmbedder, DefaultEmbedder, Embedder, HashingEmbedder, ModelSource,
+};
 pub use error::{LoomError, Result};
 pub use indexer::{EdgeResolver, IndexPipeline, IndexResult};
 pub use parsers::{AdapterRegistry, LanguageAdapter, ParseResult};

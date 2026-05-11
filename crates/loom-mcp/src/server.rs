@@ -1,5 +1,5 @@
 use loom_core::{
-    embedder::CandleEmbedder, graph::SymbolGraph, indexer::IndexPipeline, models::StoreStats,
+    embedder::DefaultEmbedder, graph::SymbolGraph, indexer::IndexPipeline, models::StoreStats,
     store::LoomDb, IndexResult, LoomConfig, SearchEngine,
 };
 use rmcp::{
@@ -56,7 +56,7 @@ struct CoreState {
     config: LoomConfig,
     db: Arc<LoomDb>,
     graph: Mutex<Arc<SymbolGraph>>,
-    embedder: Mutex<Option<Arc<CandleEmbedder>>>,
+    embedder: Mutex<Option<Arc<DefaultEmbedder>>>,
     reindex_lock: Mutex<()>,
 }
 
@@ -88,7 +88,7 @@ impl LoomServerState {
         Ok(result)
     }
 
-    fn search_engine(&self) -> loom_core::Result<SearchEngine<CandleEmbedder>> {
+    fn search_engine(&self) -> loom_core::Result<SearchEngine<DefaultEmbedder>> {
         let core = self.core()?;
         let graph = core.lock_graph();
         Ok(SearchEngine::new(
@@ -123,12 +123,12 @@ impl LoomServerState {
 }
 
 impl CoreState {
-    fn embedder(&self) -> loom_core::Result<Arc<CandleEmbedder>> {
+    fn embedder(&self) -> loom_core::Result<Arc<DefaultEmbedder>> {
         let mut guard = self.lock_embedder();
         if let Some(embedder) = guard.as_ref() {
             return Ok(Arc::clone(embedder));
         }
-        let embedder = Arc::new(CandleEmbedder::from_config(&self.config)?);
+        let embedder = Arc::new(DefaultEmbedder::from_config(&self.config)?);
         *guard = Some(Arc::clone(&embedder));
         Ok(embedder)
     }
@@ -154,7 +154,7 @@ impl CoreState {
         }
     }
 
-    fn lock_embedder(&self) -> std::sync::MutexGuard<'_, Option<Arc<CandleEmbedder>>> {
+    fn lock_embedder(&self) -> std::sync::MutexGuard<'_, Option<Arc<DefaultEmbedder>>> {
         match self.embedder.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),

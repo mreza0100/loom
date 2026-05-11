@@ -101,7 +101,6 @@ impl<R: CommandRunner> GitAnalyzer<R> {
     pub fn analyze_cochanges(&self) -> Result<Vec<CochangePair>> {
         let mut cmd = Command::new("git");
         cmd.arg("log")
-            .arg("--follow")
             .arg("--name-only")
             .arg(format!("--max-count={}", self.config.git_max_commits))
             .arg(format!("--pretty=format:{COMMIT_SENTINEL}"))

@@ -2,6 +2,8 @@ use crate::error::{LoomError, Result};
 use candle_core::{Device, Tensor};
 use candle_nn::{Module, VarBuilder};
 use candle_transformers::models::jina_bert::{BertModel, Config, DTYPE};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokenizers::utils::truncation::{TruncationDirection, TruncationParams, TruncationStrategy};
@@ -26,6 +28,87 @@ pub trait Embedder: Send + Sync {
 
 pub trait ModelSource: Send + Sync {
     fn ensure_model_files(&self, repo: &str, cache_dir: &Path) -> Result<ModelFiles>;
+}
+
+pub enum DefaultEmbedder {
+    Candle(Box<CandleEmbedder>),
+    Hashing(HashingEmbedder),
+}
+
+impl DefaultEmbedder {
+    pub fn from_config(config: &crate::config::LoomConfig) -> Result<Self> {
+        match CandleEmbedder::from_config(config) {
+            Ok(embedder) => Ok(Self::Candle(Box::new(embedder))),
+            Err(source) => {
+                warn!(
+                    error = %source,
+                    "Candle embedder unavailable; falling back to deterministic local hashing embeddings"
+                );
+                Ok(Self::Hashing(HashingEmbedder::new(
+                    config.embedding_dimensions,
+                )))
+            }
+        }
+    }
+}
+
+impl Embedder for DefaultEmbedder {
+    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        match self {
+            Self::Candle(embedder) => embedder.embed(texts),
+            Self::Hashing(embedder) => embedder.embed(texts),
+        }
+    }
+
+    fn dimensions(&self) -> usize {
+        match self {
+            Self::Candle(embedder) => embedder.dimensions(),
+            Self::Hashing(embedder) => embedder.dimensions(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct HashingEmbedder {
+    dimensions: usize,
+}
+
+impl HashingEmbedder {
+    #[must_use]
+    pub const fn new(dimensions: usize) -> Self {
+        Self { dimensions }
+    }
+}
+
+impl Embedder for HashingEmbedder {
+    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let mut embeddings = Vec::with_capacity(texts.len());
+        for text in texts {
+            let mut vector = vec![0.0_f32; self.dimensions];
+            if self.dimensions == 0 {
+                return Err(LoomError::EmbeddingDimension {
+                    expected: 1,
+                    actual: 0,
+                });
+            }
+            for token in text
+                .split(|character: char| !character.is_alphanumeric() && character != '_')
+                .filter(|token| !token.is_empty())
+            {
+                let mut hasher = DefaultHasher::new();
+                token.to_ascii_lowercase().hash(&mut hasher);
+                let index = (hasher.finish() as usize) % self.dimensions;
+                vector[index] += 1.0;
+            }
+            l2_normalize(&mut vector);
+            embeddings.push(vector);
+        }
+        Ok(embeddings)
+    }
+
+    fn dimensions(&self) -> usize {
+        self.dimensions
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
