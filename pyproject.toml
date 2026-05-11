@@ -66,6 +66,7 @@ python_version = "3.12"
 strict = true
 warn_return_any = true
 warn_unused_configs = true
+files = ["src"]
 
 [[tool.mypy.overrides]]
 module = ["sqlite_vec", "fastembed", "watchdog.*", "networkx"]

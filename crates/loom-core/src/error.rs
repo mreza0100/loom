@@ -30,6 +30,20 @@ pub enum LoomError {
     GraphLookup(String),
     #[error("invalid input: {0}")]
     InvalidInput(String),
+    #[error("parser language setup failed for {language}: {source}")]
+    ParserLanguage {
+        language: String,
+        #[source]
+        source: tree_sitter::LanguageError,
+    },
+    #[error("parser IO failed for {path}: {source}")]
+    ParserIo {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("parser produced no tree for {language} at {path}")]
+    ParserNoTree { language: String, path: String },
 }
 
 pub type Result<T> = std::result::Result<T, LoomError>;
