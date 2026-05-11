@@ -21,5 +21,14 @@
 ## Execution Log
 
 - [x] `foundation-data-model` — **DONE** ✓ (319 tests, 94.89% coverage, commit f658029, docs 9531909)
-- [ ] `graph-and-scoring` — pending
-- [ ] `evolutionary-coupling` — pending
+- [x] `graph-and-scoring` — **DONE** ✓ (440 tests, 94.46% coverage, commit c0b77e0, docs c83cc9b)
+- [x] `evolutionary-coupling` — **DONE** ✓ (537 tests, 94.71% coverage, commit 76870d5)
+
+## Final Summary
+**Completed:** 2026-05-11 | **Pipelines:** 3 succeeded, 0 failed, 0 deferred
+
+| Pipeline | Tasks | Status | Notes |
+|----------|-------|--------|-------|
+| foundation-data-model | Phase 1+3+2 | DONE | ID edges, parser fix, two-phase indexing |
+| graph-and-scoring | Phase 4+5 | DONE | NetworkX graph, real coupling scores |
+| evolutionary-coupling | Phase 6 | DONE | Git co-change analysis, third signal |
