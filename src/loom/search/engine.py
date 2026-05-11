@@ -4,7 +4,12 @@ import logging
 
 from loom.config import LoomConfig
 from loom.indexer.embedder import Embedder
-from loom.search.scoring import compute_semantic, compute_structural, fuse_signals
+from loom.search.scoring import (
+    compute_evolutionary,
+    compute_semantic,
+    compute_structural,
+    fuse_signals,
+)
 from loom.store.db import LoomDB
 from loom.store.graph import SymbolGraph
 from loom.store.models import CoupledSymbol, SearchResult, Symbol
@@ -216,7 +221,8 @@ class SearchEngine:
                     continue
                 seen.add(sym_id)
                 # Build a CouplingScore for the breakdown string
-                cs = fuse_signals(decay_score, 0.0, 0.0, self._config)
+                evo = self._evolutionary_score(target.file, source_sym.file)
+                cs = fuse_signals(decay_score, 0.0, evo, self._config)
                 dependents.append(
                     CoupledSymbol(
                         symbol=source_sym,
@@ -294,7 +300,8 @@ class SearchEngine:
                     continue
                 seen.add(sym_id)
                 struct_score = structural_scores.get(sym_id, 0.0)
-                cs = fuse_signals(struct_score, semantic_score, 0.0, self._config)
+                evo = self._evolutionary_score(target.file, sym.file)
+                cs = fuse_signals(struct_score, semantic_score, evo, self._config)
                 dependents.append(
                     CoupledSymbol(
                         symbol=sym,
@@ -338,6 +345,16 @@ class SearchEngine:
         coupled.sort(key=lambda c: c.score, reverse=True)
         return anchor, coupled
 
+    def _evolutionary_score(self, file_a: str, file_b: str) -> float:
+        """Return the evolutionary coupling score for a file pair.
+
+        Queries the cochange table for the stored co-change frequency and
+        normalises it to [0, 1] via compute_evolutionary. Returns 0.0 when
+        no cochange data exists (new repos, git analysis disabled, or same file).
+        """
+        freq = self._db.get_cochange_frequency(file_a, file_b)
+        return compute_evolutionary(freq)
+
     def _find_coupled(self, target: Symbol) -> list[CoupledSymbol]:
         """Find all symbols structurally/semantically coupled to target.
 
@@ -376,7 +393,8 @@ class SearchEngine:
                 sym = self._db.get_symbol_by_id(sym_id)
                 if sym is None:
                     continue
-                cs = fuse_signals(struct_score, 0.0, 0.0, self._config)
+                evo = self._evolutionary_score(target.file, sym.file)
+                cs = fuse_signals(struct_score, 0.0, evo, self._config)
                 coupled.append(
                     CoupledSymbol(
                         symbol=sym,
@@ -450,10 +468,13 @@ class SearchEngine:
                         # by building a fused score (structural_scores has the raw struct value)
                         struct_score = structural_scores.get(sym_id, 0.0)
                         if struct_score > 0.0:
-                            cs = fuse_signals(struct_score, semantic_score, 0.0, self._config)
                             # Update the existing entry in-place
                             for c in coupled:
                                 if c.symbol.id == sym_id:
+                                    evo = self._evolutionary_score(target.file, c.symbol.file)
+                                    cs = fuse_signals(
+                                        struct_score, semantic_score, evo, self._config
+                                    )
                                     coupled[coupled.index(c)] = CoupledSymbol(
                                         symbol=c.symbol,
                                         score=cs.combined,
@@ -465,7 +486,8 @@ class SearchEngine:
                     seen.add(sym_id)
                     sym = self._db.get_symbol_by_id(sym_id)
                     if sym:
-                        cs = fuse_signals(0.0, semantic_score, 0.0, self._config)
+                        evo = self._evolutionary_score(target.file, sym.file)
+                        cs = fuse_signals(0.0, semantic_score, evo, self._config)
                         coupled.append(
                             CoupledSymbol(
                                 symbol=sym,

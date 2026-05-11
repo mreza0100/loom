@@ -24,6 +24,10 @@ class LoomConfig:
     structural_weight: float = 0.45
     semantic_weight: float = 0.35
     evolutionary_weight: float = 0.20
+    # Git co-change analysis (evolutionary coupling)
+    enable_git_analysis: bool = True
+    git_max_commits: int = 500
+    git_max_files_per_commit: int = 20
 
     def resolve_db_path(self) -> Path:
         return self.target_dir / self.db_path
