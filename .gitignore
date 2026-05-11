@@ -46,3 +46,6 @@ sample/
 
 # uv
 .python-version
+
+# Rust
+target/
