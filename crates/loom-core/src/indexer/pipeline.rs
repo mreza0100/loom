@@ -124,7 +124,7 @@ impl<E: Embedder> IndexPipeline<E> {
         for file in files {
             let db_path = path::db_path_for(&file, &self.config)?;
             let content_hash = walk::hash_file(&file)?;
-            if self.db.get_file_hash(&db_path)?.as_deref() == Some(content_hash.as_str()) {
+            if self.db.file_index_is_fresh(&db_path, &content_hash)? {
                 result.skipped += 1;
                 continue;
             }

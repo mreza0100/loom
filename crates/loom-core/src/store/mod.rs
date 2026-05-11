@@ -549,6 +549,21 @@ impl LoomDb {
         .map_err(LoomError::from)
     }
 
+    pub fn file_index_is_fresh(&self, path: &str, content_hash: &str) -> Result<bool> {
+        if self.get_file_hash(path)?.as_deref() != Some(content_hash) {
+            return Ok(false);
+        }
+        let conn = self.reader()?;
+        let symbol_ids = select_symbol_ids_for_file(&conn, path)?;
+        if symbol_ids.is_empty() {
+            return Ok(true);
+        }
+        let vector_count = self
+            .vector_store
+            .count_embeddings_for_symbols(&conn, &symbol_ids)?;
+        Ok(vector_count == i64::try_from(symbol_ids.len()).unwrap_or(i64::MAX))
+    }
+
     pub fn set_file_hash(&self, path: &str, content_hash: &str) -> Result<()> {
         let conn = self.writer.lock();
         conn.execute(

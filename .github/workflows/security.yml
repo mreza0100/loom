@@ -1,0 +1,36 @@
+name: Security
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust-audit:
+    name: Rust dependency audit
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit Cargo.lock
+        run: cargo audit --locked
+
+  python-audit:
+    name: Python dependency audit
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Export locked Python dependencies
+        run: uv export --format requirements-txt --all-groups --no-hashes --output-file /tmp/requirements.txt
+      - name: Install pip-audit
+        run: python -m pip install pip-audit
+      - name: Audit Python dependencies
+        run: python -m pip_audit -r /tmp/requirements.txt

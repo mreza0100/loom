@@ -14,6 +14,7 @@ pub trait VectorStore: Send + Sync {
         dimensions: usize,
     ) -> Result<()>;
     fn delete_embeddings(&self, conn: &Connection, symbol_ids: &[i64]) -> Result<()>;
+    fn count_embeddings_for_symbols(&self, conn: &Connection, symbol_ids: &[i64]) -> Result<i64>;
     fn clear(&self, conn: &Connection) -> Result<()>;
     fn count(&self, conn: &Connection) -> Result<i64>;
     fn search(
@@ -84,6 +85,10 @@ impl VectorStore for BlobVectorStore {
         let sql = format!("DELETE FROM symbol_embeddings WHERE symbol_id IN ({placeholders})");
         conn.execute(&sql, params_from_iter(symbol_ids.iter()))?;
         Ok(())
+    }
+
+    fn count_embeddings_for_symbols(&self, conn: &Connection, symbol_ids: &[i64]) -> Result<i64> {
+        count_embeddings_in_table(conn, "symbol_embeddings", symbol_ids)
     }
 
     fn clear(&self, conn: &Connection) -> Result<()> {
@@ -174,6 +179,10 @@ impl VectorStore for SqliteVecStore {
         Ok(())
     }
 
+    fn count_embeddings_for_symbols(&self, conn: &Connection, symbol_ids: &[i64]) -> Result<i64> {
+        count_embeddings_in_table(conn, "vec_symbols", symbol_ids)
+    }
+
     fn clear(&self, conn: &Connection) -> Result<()> {
         conn.execute("DELETE FROM vec_symbols", [])?;
         Ok(())
@@ -260,6 +269,16 @@ fn validate_nonzero_dimensions(dimensions: usize) -> Result<()> {
         });
     }
     Ok(())
+}
+
+fn count_embeddings_in_table(conn: &Connection, table: &str, symbol_ids: &[i64]) -> Result<i64> {
+    if symbol_ids.is_empty() {
+        return Ok(0);
+    }
+    let placeholders = repeat_placeholders(symbol_ids.len());
+    let sql = format!("SELECT COUNT(*) FROM {table} WHERE symbol_id IN ({placeholders})");
+    conn.query_row(&sql, params_from_iter(symbol_ids.iter()), |row| row.get(0))
+        .map_err(Into::into)
 }
 
 pub fn repeat_placeholders(count: usize) -> String {

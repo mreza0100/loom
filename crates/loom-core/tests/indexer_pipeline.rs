@@ -1,5 +1,6 @@
 use loom_core::{
     embedder::Embedder, indexer::IndexPipeline, store::LoomDb, LoomConfig, LoomError, Result,
+    VectorBackendConfig,
 };
 use std::fs;
 use std::sync::Arc;
@@ -98,6 +99,46 @@ fn full_index_handles_more_files_than_old_parser_channel_bound() {
 }
 
 #[test]
+fn full_index_rebuilds_vectors_when_backend_changes() {
+    let dir = tempdir().unwrap();
+    let file = dir.path().join("app.py");
+    fs::write(&file, "def alpha():\n    return 1\n").unwrap();
+    let mut blob_config = LoomConfig::default_for_target(dir.path());
+    blob_config.embedding_dimensions = 3;
+    blob_config.enable_git_analysis = false;
+    blob_config.vector_backend = VectorBackendConfig::Blob;
+    let blob_db = Arc::new(LoomDb::open(blob_config.clone()).unwrap());
+    let blob_pipeline = IndexPipeline::new(
+        blob_config,
+        Arc::clone(&blob_db),
+        Arc::new(MockEmbedder { dimensions: 3 }),
+    );
+    assert_eq!(blob_pipeline.full_index().unwrap().indexed, 1);
+    assert_eq!(blob_db.get_stats().unwrap().vectors, 1);
+
+    let mut sqlite_config = LoomConfig::default_for_target(dir.path());
+    sqlite_config.embedding_dimensions = 3;
+    sqlite_config.enable_git_analysis = false;
+    sqlite_config.vector_backend = VectorBackendConfig::SqliteVec;
+    let sqlite_db = Arc::new(LoomDb::open(sqlite_config.clone()).unwrap());
+    assert_eq!(sqlite_db.get_stats().unwrap().vectors, 0);
+    let sqlite_pipeline = IndexPipeline::new(
+        sqlite_config,
+        Arc::clone(&sqlite_db),
+        Arc::new(MockEmbedder { dimensions: 3 }),
+    );
+
+    let rebuilt = sqlite_pipeline.full_index().unwrap();
+
+    assert_eq!(rebuilt.indexed, 1);
+    assert_eq!(rebuilt.skipped, 0);
+    assert_eq!(sqlite_db.get_stats().unwrap().vectors, 1);
+    assert!(sqlite_db
+        .file_index_is_fresh("app.py", &walk_hash(&file))
+        .unwrap());
+}
+
+#[test]
 fn incremental_delete_removes_symbols_vectors_and_hash() {
     let dir = tempdir().unwrap();
     let file = dir.path().join("app.py");
@@ -120,6 +161,10 @@ fn incremental_delete_removes_symbols_vectors_and_hash() {
     assert_eq!(stats.symbols, 0);
     assert_eq!(stats.vectors, 0);
     assert!(db.get_file_hash("app.py").unwrap().is_none());
+}
+
+fn walk_hash(path: &std::path::Path) -> String {
+    loom_core::indexer::walk::hash_file(path).unwrap()
 }
 
 #[test]
