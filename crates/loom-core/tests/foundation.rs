@@ -3,7 +3,7 @@ use loom_core::graph::SymbolGraph;
 use loom_core::models::{
     CoupledSymbol, CouplingScore, Edge, FileState, ParsedEdge, SearchResult, Symbol,
 };
-use loom_core::store::{sanitize_fts_query, LoomDb};
+use loom_core::store::{sanitize_fts_query, LoomDb, ReaderPragma};
 use loom_core::LoomError;
 use std::fs;
 use tempfile::TempDir;
@@ -172,9 +172,12 @@ fn model_serde_round_trips() {
 #[test]
 fn schema_pragmas_and_symbol_edge_crud() {
     let (_temp, db) = temp_db();
-    assert_eq!(db.reader_pragma_value("foreign_keys").unwrap(), "1");
     assert_eq!(
-        db.reader_pragma_value("journal_mode")
+        db.reader_pragma_value(ReaderPragma::ForeignKeys).unwrap(),
+        "1"
+    );
+    assert_eq!(
+        db.reader_pragma_value(ReaderPragma::JournalMode)
             .unwrap()
             .to_lowercase(),
         "wal"
@@ -290,6 +293,10 @@ fn fts_sanitization_and_search() {
         "Session.validate"
     );
     assert_eq!(db.search_fts("AND", 10).unwrap().len(), 0);
+    assert!(matches!(
+        db.search_fts("Session", 1_001),
+        Err(LoomError::InvalidInput(_))
+    ));
 }
 
 #[test]
@@ -328,6 +335,10 @@ fn cochange_and_stats() {
         db.get_top_cochanges("a.py", 2).unwrap()[0],
         ("b.py".to_string(), 7)
     );
+    assert!(matches!(
+        db.get_top_cochanges("a.py", 1_001),
+        Err(LoomError::InvalidInput(_))
+    ));
     assert_eq!(db.get_stats().unwrap().cochange_pairs, 2);
 }
 

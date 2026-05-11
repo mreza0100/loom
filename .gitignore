@@ -13,9 +13,14 @@ build/
 
 # Environment
 .env
+.env.*
 .env.local
 .env.test
 .env.ports
+*.pem
+*.key
+credentials.json
+secrets.*
 
 # IDE
 .idea/

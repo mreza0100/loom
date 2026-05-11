@@ -13,6 +13,23 @@ use tracing::debug;
 use vector::{repeat_placeholders, BlobVectorStore, VectorStore};
 
 const FTS5_SPECIAL: [&str; 4] = ["AND", "OR", "NOT", "NEAR"];
+const MAX_SQL_LIMIT: usize = 1_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReaderPragma {
+    ForeignKeys,
+    JournalMode,
+}
+
+impl ReaderPragma {
+    #[must_use]
+    const fn sql(self) -> &'static str {
+        match self {
+            Self::ForeignKeys => "PRAGMA foreign_keys",
+            Self::JournalMode => "PRAGMA journal_mode",
+        }
+    }
+}
 
 pub struct LoomDb {
     config: LoomConfig,
@@ -194,6 +211,7 @@ impl LoomDb {
         if sanitized.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
+        let limit = checked_sql_limit(limit)?;
         let conn = self.reader()?;
         let mut stmt = conn.prepare(
             "SELECT s.id, s.name, s.kind, s.file, s.line, s.end_line, s.language, s.context
@@ -202,7 +220,7 @@ impl LoomDb {
              WHERE symbols_fts MATCH ?
              ORDER BY rank LIMIT ?",
         )?;
-        let rows = stmt.query_map(params![sanitized, limit as i64], row_to_symbol)?;
+        let rows = stmt.query_map(params![sanitized, limit], row_to_symbol)?;
         collect_rows(rows)
     }
 
@@ -433,13 +451,14 @@ impl LoomDb {
         if limit == 0 {
             return Ok(Vec::new());
         }
+        let limit = checked_sql_limit(limit)?;
         let conn = self.reader()?;
         let mut stmt = conn.prepare(
             "SELECT CASE WHEN file_a = ? THEN file_b ELSE file_a END AS other_file, frequency
              FROM cochange WHERE file_a = ? OR file_b = ?
              ORDER BY frequency DESC LIMIT ?",
         )?;
-        let rows = stmt.query_map(params![file, file, file, limit as i64], |row| {
+        let rows = stmt.query_map(params![file, file, file, limit], |row| {
             Ok((row.get(0)?, row.get(1)?))
         })?;
         collect_rows(rows)
@@ -472,12 +491,11 @@ impl LoomDb {
         })
     }
 
-    pub fn reader_pragma_value(&self, pragma: &str) -> Result<String> {
+    pub fn reader_pragma_value(&self, pragma: ReaderPragma) -> Result<String> {
         let conn = self.reader()?;
-        let sql = format!("PRAGMA {pragma}");
-        conn.query_row(&sql, [], |row| row.get::<_, String>(0))
+        conn.query_row(pragma.sql(), [], |row| row.get::<_, String>(0))
             .or_else(|_| {
-                conn.query_row(&sql, [], |row| {
+                conn.query_row(pragma.sql(), [], |row| {
                     let value: i64 = row.get(0)?;
                     Ok(value.to_string())
                 })
@@ -676,4 +694,13 @@ fn count_table(conn: &Connection, table: &str) -> Result<i64> {
     let sql = format!("SELECT COUNT(*) FROM {table}");
     conn.query_row(&sql, [], |row| row.get(0))
         .map_err(LoomError::from)
+}
+
+fn checked_sql_limit(limit: usize) -> Result<i64> {
+    if limit > MAX_SQL_LIMIT {
+        return Err(LoomError::InvalidInput(format!(
+            "limit must be <= {MAX_SQL_LIMIT}, got {limit}"
+        )));
+    }
+    i64::try_from(limit).map_err(|_| LoomError::InvalidInput("limit is too large".to_string()))
 }

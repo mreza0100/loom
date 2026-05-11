@@ -13,7 +13,6 @@ r2d2_sqlite = "0.34"
 rusqlite = { version = "0.39", features = ["bundled", "functions", "load_extension"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
-time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
 toml = "0.9"
 tracing = "0.1"
 

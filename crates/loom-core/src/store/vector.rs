@@ -24,60 +24,6 @@ pub trait VectorStore: Send + Sync {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BlobVectorStore;
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct SqliteVecVectorStore;
-
-impl SqliteVecVectorStore {
-    #[must_use]
-    pub fn unavailable_reason() -> &'static str {
-        "sqlite-vec is intentionally isolated behind VectorStore; BlobVectorStore is the foundation fallback"
-    }
-}
-
-impl VectorStore for SqliteVecVectorStore {
-    fn create_schema(&self, _conn: &Connection, _dimensions: usize) -> Result<()> {
-        Err(LoomError::VectorStore(
-            Self::unavailable_reason().to_string(),
-        ))
-    }
-
-    fn insert_embedding(
-        &self,
-        _conn: &Connection,
-        _symbol_id: i64,
-        _embedding: &[f32],
-        _dimensions: usize,
-    ) -> Result<()> {
-        Err(LoomError::VectorStore(
-            Self::unavailable_reason().to_string(),
-        ))
-    }
-
-    fn delete_embeddings(&self, _conn: &Connection, _symbol_ids: &[i64]) -> Result<()> {
-        Err(LoomError::VectorStore(
-            Self::unavailable_reason().to_string(),
-        ))
-    }
-
-    fn count(&self, _conn: &Connection) -> Result<i64> {
-        Err(LoomError::VectorStore(
-            Self::unavailable_reason().to_string(),
-        ))
-    }
-
-    fn search(
-        &self,
-        _conn: &Connection,
-        _embedding: &[f32],
-        _dimensions: usize,
-        _limit: usize,
-    ) -> Result<Vec<(i64, f64)>> {
-        Err(LoomError::VectorStore(
-            Self::unavailable_reason().to_string(),
-        ))
-    }
-}
-
 impl VectorStore for BlobVectorStore {
     fn create_schema(&self, conn: &Connection, _dimensions: usize) -> Result<()> {
         conn.execute(
