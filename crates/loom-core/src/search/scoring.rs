@@ -23,11 +23,13 @@ pub fn compute_semantic(distance: f64) -> f64 {
 }
 
 #[must_use]
-pub fn compute_evolutionary(frequency: i64, max_frequency: i64) -> f64 {
+pub fn compute_evolutionary(frequency: i64, recency: f64, max_frequency: i64) -> f64 {
     if max_frequency <= 0 {
         return 0.0;
     }
-    ((frequency as f64) / (max_frequency as f64)).clamp(0.0, 1.0)
+    let frequency_score = ((frequency as f64) / (max_frequency as f64)).clamp(0.0, 1.0);
+    let recency_score = recency.clamp(0.0, 1.0);
+    (0.75 * frequency_score + 0.25 * recency_score).clamp(0.0, 1.0)
 }
 
 #[must_use]

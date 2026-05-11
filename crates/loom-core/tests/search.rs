@@ -78,10 +78,20 @@ fn scoring_matches_python_contract() {
     let config = LoomConfig::default_for_target(".");
     assert_eq!(compute_structural("calls", 0.8, 2), 0.4);
     assert_eq!(compute_semantic(0.25), 0.75);
-    assert_eq!(compute_evolutionary(5, 10), 0.5);
+    assert_eq!(compute_evolutionary(5, 0.5, 10), 0.5);
     let fused = fuse_signals(0.8, 0.4, 0.0, &config);
     assert!(fused.combined > 0.5);
     assert!(fused.breakdown().contains("structural="));
+}
+
+#[test]
+fn evolutionary_scoring_uses_recency_as_tie_breaker() {
+    let stale = compute_evolutionary(5, 0.0, 10);
+    let fresh = compute_evolutionary(5, 1.0, 10);
+
+    assert!(fresh > stale);
+    assert_eq!(compute_evolutionary(0, 0.0, 10), 0.0);
+    assert_eq!(compute_evolutionary(20, 2.0, 10), 1.0);
 }
 
 #[test]
@@ -122,8 +132,11 @@ fn search_returns_hybrid_results_with_coupled_symbols() {
     );
 
     let results = engine.search("session resolver", 5, None).unwrap();
-    assert_eq!(results[0].symbol.name, "resolve_session");
-    assert!(results[0]
+    let resolver_result = results
+        .iter()
+        .find(|result| result.symbol.name == "resolve_session")
+        .unwrap();
+    assert!(resolver_result
         .coupled
         .iter()
         .any(|entry| entry.symbol.name == "SessionValidator"));

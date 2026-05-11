@@ -1,4 +1,5 @@
 use crate::error::{LoomError, Result};
+use crate::parsers::AdapterRegistry;
 use serde::Deserialize;
 use std::collections::BTreeSet;
 use std::fs;
@@ -6,6 +7,40 @@ use std::path::{Component, Path, PathBuf};
 
 const ALWAYS_EXCLUDED: [&str; 3] = [".git", "__pycache__", ".loom"];
 const SUPPORTED_EMBEDDING_MODELS: [&str; 1] = ["jinaai/jina-embeddings-v2-base-code"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum VectorBackendConfig {
+    SqliteVec,
+    Blob,
+}
+
+impl VectorBackendConfig {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SqliteVec => "sqlite-vec",
+            Self::Blob => "blob",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EmbeddingBackendConfig {
+    Candle,
+    Hashing,
+}
+
+impl EmbeddingBackendConfig {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Candle => "candle",
+            Self::Hashing => "hashing",
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LoomConfig {
@@ -16,6 +51,10 @@ pub struct LoomConfig {
     pub debounce_seconds: f64,
     pub embedding_model: String,
     pub allow_custom_embedding_model: bool,
+    pub vector_backend: VectorBackendConfig,
+    pub embedding_backend: EmbeddingBackendConfig,
+    pub allow_hashing_embedder_fallback: bool,
+    pub auto_watch: bool,
     pub embedding_dimensions: usize,
     pub max_file_size_bytes: usize,
     pub excluded_dirs: BTreeSet<String>,
@@ -37,6 +76,10 @@ struct PartialConfig {
     debounce_seconds: Option<f64>,
     embedding_model: Option<String>,
     allow_custom_embedding_model: Option<bool>,
+    vector_backend: Option<VectorBackendConfig>,
+    embedding_backend: Option<EmbeddingBackendConfig>,
+    allow_hashing_embedder_fallback: Option<bool>,
+    auto_watch: Option<bool>,
     embedding_dimensions: Option<usize>,
     max_file_size_bytes: Option<usize>,
     excluded_dirs: Option<Vec<String>>,
@@ -53,26 +96,9 @@ struct PartialConfig {
 impl LoomConfig {
     #[must_use]
     pub fn default_for_target(target_dir: impl Into<PathBuf>) -> Self {
-        let watch_extensions = [
-            ".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".java", ".rs", ".cs",
-        ]
-        .into_iter()
-        .map(str::to_string)
-        .collect();
-        let mut excluded_dirs: BTreeSet<String> = [
-            ".git",
-            "__pycache__",
-            ".loom",
-            "node_modules",
-            ".venv",
-            "venv",
-            "target",
-            "dist",
-            "build",
-        ]
-        .into_iter()
-        .map(str::to_string)
-        .collect();
+        let registry = AdapterRegistry::with_builtin_adapters();
+        let watch_extensions = registry.get_all_extensions();
+        let mut excluded_dirs = registry.get_all_excluded_dirs();
         Self::union_always_excluded(&mut excluded_dirs);
 
         Self {
@@ -85,6 +111,10 @@ impl LoomConfig {
             debounce_seconds: 0.5,
             embedding_model: "jinaai/jina-embeddings-v2-base-code".to_string(),
             allow_custom_embedding_model: false,
+            vector_backend: VectorBackendConfig::SqliteVec,
+            embedding_backend: EmbeddingBackendConfig::Candle,
+            allow_hashing_embedder_fallback: false,
+            auto_watch: true,
             embedding_dimensions: 768,
             max_file_size_bytes: 512_000,
             excluded_dirs,
@@ -156,6 +186,18 @@ impl LoomConfig {
         }
         if let Some(allow_custom_embedding_model) = partial.allow_custom_embedding_model {
             self.allow_custom_embedding_model = allow_custom_embedding_model;
+        }
+        if let Some(vector_backend) = partial.vector_backend {
+            self.vector_backend = vector_backend;
+        }
+        if let Some(embedding_backend) = partial.embedding_backend {
+            self.embedding_backend = embedding_backend;
+        }
+        if let Some(allow_hashing_embedder_fallback) = partial.allow_hashing_embedder_fallback {
+            self.allow_hashing_embedder_fallback = allow_hashing_embedder_fallback;
+        }
+        if let Some(auto_watch) = partial.auto_watch {
+            self.auto_watch = auto_watch;
         }
         if let Some(embedding_dimensions) = partial.embedding_dimensions {
             self.embedding_dimensions = embedding_dimensions;

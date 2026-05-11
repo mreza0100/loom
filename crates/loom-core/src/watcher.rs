@@ -144,10 +144,8 @@ impl Debouncer {
                     self.force_enqueue(path);
                 }
             }
-            EventKind::Modify(notify::event::ModifyKind::Name(_)) => {
-                if let Some(path) = event.paths.last() {
-                    self.force_enqueue(path.clone());
-                }
+            EventKind::Modify(notify::event::ModifyKind::Name(mode)) => {
+                self.handle_name_event(mode, event.paths);
             }
             EventKind::Modify(_) => {
                 for path in event.paths {
@@ -219,6 +217,38 @@ impl Debouncer {
 
     pub fn pending_paths(&self) -> Vec<PathBuf> {
         self.pending.iter().cloned().collect()
+    }
+
+    fn handle_name_event(&mut self, mode: notify::event::RenameMode, paths: Vec<PathBuf>) {
+        match mode {
+            notify::event::RenameMode::Both if paths.len() >= 2 => {
+                if let Some(old_path) = paths.first() {
+                    self.enqueue_deleted(old_path.clone());
+                }
+                if let Some(new_path) = paths.last() {
+                    self.force_enqueue(new_path.clone());
+                }
+            }
+            notify::event::RenameMode::From => {
+                for path in paths {
+                    self.enqueue_deleted(path);
+                }
+            }
+            notify::event::RenameMode::To => {
+                for path in paths {
+                    self.force_enqueue(path);
+                }
+            }
+            _ => {
+                for path in paths {
+                    if path.exists() {
+                        self.force_enqueue(path);
+                    } else {
+                        self.enqueue_deleted(path);
+                    }
+                }
+            }
+        }
     }
 
     fn accepts(&self, candidate: &Path, force: bool) -> bool {

@@ -1,6 +1,8 @@
 use loom_core::{
-    embedder::{build_symbol_text, Embedder, HashingEmbedder, ModelFiles, ModelSource},
-    Result,
+    embedder::{
+        build_symbol_text, DefaultEmbedder, Embedder, HashingEmbedder, ModelFiles, ModelSource,
+    },
+    EmbeddingBackendConfig, LoomConfig, LoomError, Result,
 };
 use std::path::{Path, PathBuf};
 
@@ -64,4 +66,49 @@ fn hashing_embedder_handles_empty_text_with_zero_vector() {
     let vector = embedder.embed_single("").unwrap();
 
     assert_eq!(vector, vec![0.0; 8]);
+}
+
+#[test]
+fn default_embedder_hashing_mode_skips_candle_loader() {
+    let mut config = LoomConfig::default_for_target(".");
+    config.embedding_backend = EmbeddingBackendConfig::Hashing;
+    config.embedding_dimensions = 8;
+
+    let embedder = DefaultEmbedder::from_config_with_candle_loader(&config, || {
+        panic!("hashing mode must not initialize Candle")
+    })
+    .unwrap();
+    let status = embedder.status();
+
+    assert_eq!(status.backend, "hashing");
+    assert!(!status.degraded);
+    assert_eq!(status.dimensions, 8);
+}
+
+#[test]
+fn default_embedder_candle_failure_is_strict_by_default() {
+    let config = LoomConfig::default_for_target(".");
+
+    let result = DefaultEmbedder::from_config_with_candle_loader(&config, || {
+        Err(LoomError::EmbedderModel("boom".to_string()))
+    });
+
+    assert!(matches!(result, Err(LoomError::EmbedderModel(_))));
+}
+
+#[test]
+fn default_embedder_explicit_fallback_reports_degraded_hashing() {
+    let mut config = LoomConfig::default_for_target(".");
+    config.embedding_dimensions = 8;
+    config.allow_hashing_embedder_fallback = true;
+
+    let embedder = DefaultEmbedder::from_config_with_candle_loader(&config, || {
+        Err(LoomError::EmbedderModel("boom".to_string()))
+    })
+    .unwrap();
+    let status = embedder.status();
+
+    assert_eq!(status.backend, "hashing");
+    assert!(status.degraded);
+    assert_eq!(status.dimensions, 8);
 }

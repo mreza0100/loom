@@ -329,8 +329,12 @@ impl<E: Embedder> SearchEngine<E> {
     }
 
     fn evolutionary_score(&self, file_a: &str, file_b: &str) -> Result<f64> {
+        let Some(cochange) = self.db.get_cochange(file_a, file_b)? else {
+            return Ok(0.0);
+        };
         Ok(compute_evolutionary(
-            self.db.get_cochange_frequency(file_a, file_b)?,
+            cochange.frequency,
+            cochange.recency,
             10,
         ))
     }

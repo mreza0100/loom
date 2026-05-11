@@ -3,8 +3,11 @@ use loom_core::graph::SymbolGraph;
 use loom_core::models::{
     CoupledSymbol, CouplingScore, Edge, FileState, ParsedEdge, SearchResult, Symbol,
 };
-use loom_core::store::{sanitize_fts_query, LoomDb, ReaderPragma};
-use loom_core::LoomError;
+use loom_core::store::{
+    migrations::CURRENT_SCHEMA_VERSION, sanitize_fts_query, LoomDb, ReaderPragma,
+};
+use loom_core::{AdapterRegistry, LoomError, VectorBackendConfig};
+use rusqlite::Connection;
 use std::fs;
 use tempfile::TempDir;
 
@@ -57,8 +60,20 @@ fn config_defaults_and_missing_toml_fallback() {
     );
     assert_eq!(loaded.embedding_dimensions, 768);
     assert_eq!(loaded.structural_weight, 0.45);
+    assert_eq!(loaded.vector_backend, VectorBackendConfig::SqliteVec);
+    assert_eq!(loaded.vector_backend.as_str(), "sqlite-vec");
+    assert_eq!(loaded.embedding_backend.as_str(), "candle");
+    assert!(loaded.auto_watch);
+    assert!(!loaded.allow_hashing_embedder_fallback);
     assert!(loaded.excluded_dirs.contains(".git"));
     assert!(loaded.watch_extensions.contains(".rs"));
+    assert_eq!(
+        loaded.watch_extensions,
+        AdapterRegistry::with_builtin_adapters().get_all_extensions()
+    );
+    for excluded in AdapterRegistry::with_builtin_adapters().get_all_excluded_dirs() {
+        assert!(loaded.excluded_dirs.contains(&excluded));
+    }
 }
 
 #[test]
@@ -72,6 +87,10 @@ db_path = ".loom/custom.db"
 embedding_dimensions = 4
 excluded_dirs = ["node_modules"]
 semantic_weight = 0.5
+vector_backend = "blob"
+embedding_backend = "hashing"
+allow_hashing_embedder_fallback = true
+auto_watch = false
 "#,
     )
     .unwrap();
@@ -79,11 +98,62 @@ semantic_weight = 0.5
     let loaded = LoomConfig::load(temp.path()).unwrap();
     assert_eq!(loaded.embedding_dimensions, 4);
     assert_eq!(loaded.semantic_weight, 0.5);
+    assert_eq!(loaded.vector_backend, VectorBackendConfig::Blob);
+    assert_eq!(loaded.embedding_backend.as_str(), "hashing");
+    assert!(loaded.allow_hashing_embedder_fallback);
+    assert!(!loaded.auto_watch);
     assert!(loaded.excluded_dirs.contains("node_modules"));
     assert!(loaded.excluded_dirs.contains(".loom"));
     let db_path = loaded.resolve_db_path().unwrap();
     assert_eq!(db_path, temp.path().join(".loom/custom.db"));
     assert!(db_path.parent().unwrap().exists());
+}
+
+#[test]
+fn vector_backend_selection_and_schema_version_are_visible() {
+    let temp = tempfile::tempdir().unwrap();
+    let default_db = LoomDb::open(LoomConfig::default_for_target(temp.path())).unwrap();
+    assert_eq!(default_db.vector_backend_name(), "sqlite-vec");
+    assert_eq!(default_db.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+
+    let blob_temp = tempfile::tempdir().unwrap();
+    let mut blob_config = LoomConfig::default_for_target(blob_temp.path());
+    blob_config.vector_backend = VectorBackendConfig::Blob;
+    let blob_db = LoomDb::open(blob_config).unwrap();
+    assert_eq!(blob_db.vector_backend_name(), "blob");
+    assert_eq!(blob_db.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+}
+
+#[test]
+fn old_schema_without_recency_upgrades_idempotently() {
+    let temp = tempfile::tempdir().unwrap();
+    let db_dir = temp.path().join(".loom");
+    fs::create_dir_all(&db_dir).unwrap();
+    let db_path = db_dir.join("loom.db");
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "
+        CREATE TABLE cochange (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_a TEXT NOT NULL,
+            file_b TEXT NOT NULL,
+            frequency INTEGER NOT NULL DEFAULT 1,
+            UNIQUE(file_a, file_b)
+        );
+        INSERT INTO cochange (file_a, file_b, frequency) VALUES ('a.py', 'b.py', 3);
+        ",
+    )
+    .unwrap();
+    drop(conn);
+
+    let db = LoomDb::open(LoomConfig::default_for_target(temp.path())).unwrap();
+    assert_eq!(db.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+    let cochange = db.get_cochange("a.py", "b.py").unwrap().unwrap();
+    assert_eq!(cochange.frequency, 3);
+    assert_eq!(cochange.recency, 0.0);
+
+    let reopened = LoomDb::open(LoomConfig::default_for_target(temp.path())).unwrap();
+    assert_eq!(reopened.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
 }
 
 #[test]

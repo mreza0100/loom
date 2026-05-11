@@ -1,4 +1,7 @@
-use crate::error::{LoomError, Result};
+use crate::{
+    config::{EmbeddingBackendConfig, LoomConfig},
+    error::{LoomError, Result},
+};
 use candle_core::{Device, Tensor};
 use candle_nn::{Module, VarBuilder};
 use candle_transformers::models::jina_bert::{BertModel, Config, DTYPE};
@@ -32,22 +35,66 @@ pub trait ModelSource: Send + Sync {
 
 pub enum DefaultEmbedder {
     Candle(Box<CandleEmbedder>),
-    Hashing(HashingEmbedder),
+    Hashing {
+        embedder: HashingEmbedder,
+        degraded: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbedderStatus {
+    pub backend: &'static str,
+    pub degraded: bool,
+    pub dimensions: usize,
+    pub model: Option<String>,
 }
 
 impl DefaultEmbedder {
-    pub fn from_config(config: &crate::config::LoomConfig) -> Result<Self> {
-        match CandleEmbedder::from_config(config) {
-            Ok(embedder) => Ok(Self::Candle(Box::new(embedder))),
-            Err(source) => {
-                warn!(
-                    error = %source,
-                    "Candle embedder unavailable; falling back to deterministic local hashing embeddings"
-                );
-                Ok(Self::Hashing(HashingEmbedder::new(
-                    config.embedding_dimensions,
-                )))
-            }
+    pub fn from_config(config: &LoomConfig) -> Result<Self> {
+        Self::from_config_with_candle_loader(config, || CandleEmbedder::from_config(config))
+    }
+
+    pub fn from_config_with_candle_loader<F>(config: &LoomConfig, load_candle: F) -> Result<Self>
+    where
+        F: FnOnce() -> Result<CandleEmbedder>,
+    {
+        match config.embedding_backend {
+            EmbeddingBackendConfig::Hashing => Ok(Self::Hashing {
+                embedder: HashingEmbedder::new(config.embedding_dimensions),
+                degraded: false,
+            }),
+            EmbeddingBackendConfig::Candle => match load_candle() {
+                Ok(embedder) => Ok(Self::Candle(Box::new(embedder))),
+                Err(source) if config.allow_hashing_embedder_fallback => {
+                    warn!(
+                        error = ?source,
+                        "Candle embedder unavailable; explicit hashing fallback enabled"
+                    );
+                    Ok(Self::Hashing {
+                        embedder: HashingEmbedder::new(config.embedding_dimensions),
+                        degraded: true,
+                    })
+                }
+                Err(source) => Err(source),
+            },
+        }
+    }
+
+    #[must_use]
+    pub fn status(&self) -> EmbedderStatus {
+        match self {
+            Self::Candle(embedder) => EmbedderStatus {
+                backend: "candle",
+                degraded: false,
+                dimensions: embedder.dimensions(),
+                model: Some(embedder.model_repo().to_string()),
+            },
+            Self::Hashing { embedder, degraded } => EmbedderStatus {
+                backend: "hashing",
+                degraded: *degraded,
+                dimensions: embedder.dimensions(),
+                model: None,
+            },
         }
     }
 }
@@ -56,14 +103,14 @@ impl Embedder for DefaultEmbedder {
     fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         match self {
             Self::Candle(embedder) => embedder.embed(texts),
-            Self::Hashing(embedder) => embedder.embed(texts),
+            Self::Hashing { embedder, .. } => embedder.embed(texts),
         }
     }
 
     fn dimensions(&self) -> usize {
         match self {
             Self::Candle(embedder) => embedder.dimensions(),
-            Self::Hashing(embedder) => embedder.dimensions(),
+            Self::Hashing { embedder, .. } => embedder.dimensions(),
         }
     }
 }
@@ -145,6 +192,7 @@ impl ModelSource for HfHubModelSource {
 
 pub struct CandleEmbedder<S: ModelSource = HfHubModelSource> {
     dimensions: usize,
+    model_repo: String,
     tokenizer: Tokenizer,
     device: Device,
     model: BertModel,
@@ -196,6 +244,7 @@ impl<S: ModelSource> CandleEmbedder<S> {
             .map_err(|source| LoomError::EmbedderModel(source.to_string()))?;
         Ok(Self {
             dimensions,
+            model_repo,
             tokenizer,
             device,
             model,
@@ -215,6 +264,11 @@ impl<S: ModelSource> CandleEmbedder<S> {
             }
         }
         Ok(())
+    }
+
+    #[must_use]
+    pub fn model_repo(&self) -> &str {
+        &self.model_repo
     }
 }
 

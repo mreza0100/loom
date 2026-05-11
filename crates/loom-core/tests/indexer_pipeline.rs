@@ -123,6 +123,45 @@ fn incremental_delete_removes_symbols_vectors_and_hash() {
 }
 
 #[test]
+fn incremental_rename_removes_old_path_and_indexes_new_path() {
+    let dir = tempdir().unwrap();
+    let old_file = dir.path().join("old.py");
+    let new_file = dir.path().join("new.py");
+    fs::write(&old_file, "def renamed_symbol():\n    return 1\n").unwrap();
+    let mut config = LoomConfig::default_for_target(dir.path());
+    config.embedding_dimensions = 3;
+    config.enable_git_analysis = false;
+    let db = Arc::new(LoomDb::open(config.clone()).unwrap());
+    let pipeline = IndexPipeline::new(
+        config,
+        Arc::clone(&db),
+        Arc::new(MockEmbedder { dimensions: 3 }),
+    );
+    pipeline.full_index().unwrap();
+    fs::rename(&old_file, &new_file).unwrap();
+
+    let result = pipeline
+        .incremental_index([old_file.clone(), new_file.clone()])
+        .unwrap();
+
+    assert_eq!(result.deleted, 1);
+    assert_eq!(result.indexed, 1);
+    let stats = db.get_stats().unwrap();
+    assert_eq!(stats.files, 1);
+    assert_eq!(stats.symbols, 1);
+    assert_eq!(stats.vectors, 1);
+    assert!(db.get_file_hash("old.py").unwrap().is_none());
+    assert!(db.get_file_hash("new.py").unwrap().is_some());
+    let symbols = db
+        .get_symbol_by_name("renamed_symbol", None)
+        .unwrap()
+        .into_iter()
+        .map(|symbol| symbol.file)
+        .collect::<Vec<_>>();
+    assert_eq!(symbols, vec!["new.py"]);
+}
+
+#[test]
 fn incremental_index_rejects_relative_path_escape() {
     let dir = tempdir().unwrap();
     let target = dir.path().join("target");

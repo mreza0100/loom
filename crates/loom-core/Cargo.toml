@@ -24,6 +24,7 @@ rusqlite = { version = "0.39", features = ["bundled", "functions"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+sqlite-vec = { version = "=0.1.9", default-features = false }
 thiserror = "2"
 tokenizers = "0.23"
 toml = "0.9"
@@ -36,6 +37,7 @@ tree-sitter-javascript = "0.25"
 tree-sitter-python = "0.25"
 tree-sitter-rust = "0.24"
 tree-sitter-typescript = "0.23"
+zerocopy = { version = "0.8.33", default-features = false, features = ["std"] }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 candle-core = { version = "0.10", default-features = false }

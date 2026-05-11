@@ -1,6 +1,11 @@
 use loom_core::{
-    embedder::DefaultEmbedder, graph::SymbolGraph, indexer::IndexPipeline, models::StoreStats,
-    store::LoomDb, IndexResult, LoomConfig, SearchEngine,
+    embedder::DefaultEmbedder,
+    graph::SymbolGraph,
+    indexer::IndexPipeline,
+    models::StoreStats,
+    store::LoomDb,
+    watcher::{FnChangeHandler, LoomWatcher},
+    IndexResult, LoomConfig, SearchEngine,
 };
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -10,8 +15,8 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-use tracing::error;
+use std::sync::{Arc, Mutex, Weak};
+use tracing::{error, warn};
 
 const MAX_LIMIT: usize = 100;
 const MAX_QUERY_BYTES: usize = 4_096;
@@ -44,6 +49,12 @@ pub struct StatusResponse {
     pub stats: StoreStats,
     pub graph_nodes: usize,
     pub graph_edges: usize,
+    pub vector_backend: String,
+    pub embedder_backend: Option<String>,
+    pub embedder_degraded: bool,
+    pub schema_version: i64,
+    pub watcher_active: bool,
+    pub auto_watch: bool,
 }
 
 #[derive(Clone)]
@@ -58,6 +69,7 @@ struct CoreState {
     graph: Mutex<Arc<SymbolGraph>>,
     embedder: Mutex<Option<Arc<DefaultEmbedder>>>,
     reindex_lock: Mutex<()>,
+    watcher: Mutex<Option<LoomWatcher>>,
 }
 
 impl LoomServerState {
@@ -71,10 +83,19 @@ impl LoomServerState {
     pub fn status(&self) -> loom_core::Result<StatusResponse> {
         let core = self.core()?;
         let graph = core.lock_graph();
+        let embedder_status = core.embedder_status();
         Ok(StatusResponse {
             stats: core.db.get_stats()?,
             graph_nodes: graph.node_count(),
             graph_edges: graph.edge_count(),
+            vector_backend: core.db.vector_backend_name().to_string(),
+            embedder_backend: embedder_status
+                .as_ref()
+                .map(|status| status.backend.to_string()),
+            embedder_degraded: embedder_status.is_some_and(|status| status.degraded),
+            schema_version: core.db.schema_version()?,
+            watcher_active: core.watcher_active(),
+            auto_watch: core.config.auto_watch,
         })
     }
 
@@ -116,13 +137,43 @@ impl LoomServerState {
             graph: Mutex::new(graph),
             embedder: Mutex::new(None),
             reindex_lock: Mutex::new(()),
+            watcher: Mutex::new(None),
         });
+        if core.config.auto_watch {
+            core.start_watcher_once()?;
+        }
         *guard = Some(Arc::clone(&core));
         Ok(core)
     }
 }
 
 impl CoreState {
+    fn start_watcher_once(self: &Arc<Self>) -> loom_core::Result<()> {
+        let mut guard = self.lock_watcher();
+        if guard.is_some() {
+            return Ok(());
+        }
+        let weak: Weak<Self> = Arc::downgrade(self);
+        let handler = Arc::new(FnChangeHandler::new(move |paths| {
+            let Some(core) = weak.upgrade() else {
+                return Ok(());
+            };
+            core.handle_changed_paths(paths).map(|_| ())
+        }));
+        let watcher = LoomWatcher::start(self.config.clone(), handler)?;
+        *guard = Some(watcher);
+        Ok(())
+    }
+
+    fn handle_changed_paths(&self, paths: Vec<PathBuf>) -> loom_core::Result<IndexResult> {
+        let _guard = self.lock_reindex();
+        let embedder = self.embedder()?;
+        let pipeline = IndexPipeline::new(self.config.clone(), Arc::clone(&self.db), embedder);
+        let result = pipeline.incremental_index(paths)?;
+        self.refresh_graph()?;
+        Ok(result)
+    }
+
     fn embedder(&self) -> loom_core::Result<Arc<DefaultEmbedder>> {
         let mut guard = self.lock_embedder();
         if let Some(embedder) = guard.as_ref() {
@@ -131,6 +182,11 @@ impl CoreState {
         let embedder = Arc::new(DefaultEmbedder::from_config(&self.config)?);
         *guard = Some(Arc::clone(&embedder));
         Ok(embedder)
+    }
+
+    fn embedder_status(&self) -> Option<loom_core::embedder::EmbedderStatus> {
+        let guard = self.lock_embedder();
+        guard.as_ref().map(|embedder| embedder.status())
     }
 
     fn refresh_graph(&self) -> loom_core::Result<()> {
@@ -166,6 +222,20 @@ impl CoreState {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
+    }
+
+    fn lock_watcher(&self) -> std::sync::MutexGuard<'_, Option<LoomWatcher>> {
+        match self.watcher.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                warn!("watcher lock poisoned; recovering inner state");
+                poisoned.into_inner()
+            }
+        }
+    }
+
+    fn watcher_active(&self) -> bool {
+        self.lock_watcher().is_some()
     }
 }
 
@@ -345,10 +415,25 @@ mod tests {
     #[test]
     fn status_opens_db_without_loading_embedder() {
         let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join(".loom")).unwrap();
+        std::fs::write(
+            temp.path().join(".loom/config.toml"),
+            r#"
+vector_backend = "blob"
+embedding_backend = "hashing"
+auto_watch = false
+"#,
+        )
+        .unwrap();
         let state = LoomServerState::new(temp.path().to_path_buf());
         let status = state.status().unwrap();
         assert_eq!(status.stats.symbols, 0);
         assert_eq!(status.graph_nodes, 0);
+        assert_eq!(status.vector_backend, "blob");
+        assert_eq!(status.embedder_backend, None);
+        assert!(!status.embedder_degraded);
+        assert!(!status.watcher_active);
+        assert!(!status.auto_watch);
     }
 
     #[test]
@@ -371,5 +456,85 @@ mod tests {
         ] {
             assert!(names.contains(expected));
         }
+    }
+
+    #[test]
+    fn changed_paths_helper_indexes_incrementally_and_refreshes_graph() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join(".loom")).unwrap();
+        std::fs::write(
+            temp.path().join(".loom/config.toml"),
+            r#"
+vector_backend = "blob"
+embedding_backend = "hashing"
+embedding_dimensions = 16
+auto_watch = false
+"#,
+        )
+        .unwrap();
+        let src_dir = temp.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let source = src_dir.join("app.py");
+        std::fs::write(
+            &source,
+            "def alpha():\n    return beta()\n\ndef beta():\n    return 1\n",
+        )
+        .unwrap();
+
+        let state = LoomServerState::new(temp.path().to_path_buf());
+        let core = state.core().unwrap();
+        let result = core.handle_changed_paths(vec![source]).unwrap();
+        let status = state.status().unwrap();
+
+        assert_eq!(result.indexed, 1);
+        assert_eq!(status.stats.symbols, 2);
+        assert!(status.graph_nodes > 0);
+        assert_eq!(status.embedder_backend, Some("hashing".to_string()));
+    }
+
+    #[test]
+    fn changed_paths_helper_handles_rename_without_stale_index_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join(".loom")).unwrap();
+        std::fs::write(
+            temp.path().join(".loom/config.toml"),
+            r#"
+vector_backend = "blob"
+embedding_backend = "hashing"
+embedding_dimensions = 16
+auto_watch = false
+"#,
+        )
+        .unwrap();
+        let src_dir = temp.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let old_path = src_dir.join("old.py");
+        let new_path = src_dir.join("new.py");
+        std::fs::write(&old_path, "def renamed_symbol():\n    return 1\n").unwrap();
+
+        let state = LoomServerState::new(temp.path().to_path_buf());
+        let core = state.core().unwrap();
+        core.handle_changed_paths(vec![old_path.clone()]).unwrap();
+        std::fs::rename(&old_path, &new_path).unwrap();
+
+        let result = core
+            .handle_changed_paths(vec![old_path.clone(), new_path.clone()])
+            .unwrap();
+        let status = state.status().unwrap();
+
+        assert_eq!(result.deleted, 1);
+        assert_eq!(result.indexed, 1);
+        assert_eq!(status.stats.files, 1);
+        assert_eq!(status.stats.symbols, 1);
+        assert!(core.db.get_file_hash("src/old.py").unwrap().is_none());
+        assert!(core.db.get_file_hash("src/new.py").unwrap().is_some());
+        let symbols = core
+            .db
+            .get_symbol_by_name("renamed_symbol", None)
+            .unwrap()
+            .into_iter()
+            .map(|symbol| symbol.file)
+            .collect::<Vec<_>>();
+        assert_eq!(symbols, vec!["src/new.py"]);
     }
 }

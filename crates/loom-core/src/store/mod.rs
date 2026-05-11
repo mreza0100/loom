@@ -1,8 +1,10 @@
+pub mod migrations;
 pub mod vector;
 
-use crate::config::LoomConfig;
+use crate::config::{LoomConfig, VectorBackendConfig};
 use crate::error::{LoomError, Result};
 use crate::models::{Edge, StoreStats, Symbol};
+use migrations::run_migrations;
 use parking_lot::Mutex;
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
@@ -10,7 +12,9 @@ use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::debug;
-use vector::{repeat_placeholders, BlobVectorStore, VectorStore};
+use vector::{
+    register_sqlite_vec_once, repeat_placeholders, BlobVectorStore, SqliteVecStore, VectorStore,
+};
 
 const FTS5_SPECIAL: [&str; 4] = ["AND", "OR", "NOT", "NEAR"];
 const MAX_SQL_LIMIT: usize = 1_000;
@@ -58,6 +62,13 @@ pub struct LoomDb {
 impl LoomDb {
     pub fn open(config: LoomConfig) -> Result<Self> {
         let db_path = config.resolve_db_path()?;
+        let vector_store: Arc<dyn VectorStore> = match config.vector_backend {
+            VectorBackendConfig::SqliteVec => {
+                register_sqlite_vec_once()?;
+                Arc::new(SqliteVecStore)
+            }
+            VectorBackendConfig::Blob => Arc::new(BlobVectorStore),
+        };
         let writer = Connection::open(&db_path)?;
         apply_pragmas(&writer)?;
 
@@ -73,15 +84,33 @@ impl LoomDb {
             db_path,
             writer: Mutex::new(writer),
             readers,
-            vector_store: Arc::new(BlobVectorStore),
+            vector_store,
         };
-        db.create_schema()?;
+        {
+            let conn = db.writer.lock();
+            run_migrations(&conn, &*db.vector_store, db.config.embedding_dimensions)?;
+        }
+        debug!(
+            db_path = %db.db_path.display(),
+            vector_backend = db.vector_store.backend_name(),
+            "LoomDb schema initialized"
+        );
         Ok(db)
     }
 
     #[must_use]
     pub fn db_path(&self) -> &PathBuf {
         &self.db_path
+    }
+
+    #[must_use]
+    pub fn vector_backend_name(&self) -> &'static str {
+        self.vector_store.backend_name()
+    }
+
+    pub fn schema_version(&self) -> Result<i64> {
+        let conn = self.reader()?;
+        migrations::schema_version(&conn)
     }
 
     pub fn insert_symbol(&self, symbol: &Symbol) -> Result<i64> {
@@ -717,67 +746,6 @@ impl LoomDb {
             .map_err(LoomError::from)
     }
 
-    fn create_schema(&self) -> Result<()> {
-        let conn = self.writer.lock();
-        conn.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS symbols (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                kind TEXT NOT NULL,
-                file TEXT NOT NULL,
-                line INTEGER NOT NULL,
-                end_line INTEGER NOT NULL,
-                language TEXT NOT NULL,
-                context TEXT NOT NULL DEFAULT ''
-            );
-            CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
-            CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file);
-
-            CREATE TABLE IF NOT EXISTS edges (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                source_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
-                target_id INTEGER REFERENCES symbols(id) ON DELETE SET NULL,
-                target_name TEXT NOT NULL,
-                target_file TEXT,
-                relationship TEXT NOT NULL,
-                confidence REAL NOT NULL DEFAULT 0.0,
-                original_name TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id);
-            CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
-            CREATE INDEX IF NOT EXISTS idx_edges_target_name ON edges(target_name);
-            CREATE INDEX IF NOT EXISTS idx_edges_unresolved ON edges(target_id) WHERE target_id IS NULL;
-
-            CREATE TABLE IF NOT EXISTS index_meta (
-                file_path TEXT PRIMARY KEY,
-                content_hash TEXT NOT NULL,
-                last_indexed TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-
-            CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
-                name, kind, file, context, content=symbols, content_rowid=id
-            );
-
-            CREATE TABLE IF NOT EXISTS cochange (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                file_a TEXT NOT NULL,
-                file_b TEXT NOT NULL,
-                frequency INTEGER NOT NULL DEFAULT 1,
-                recency REAL NOT NULL DEFAULT 0.0,
-                UNIQUE(file_a, file_b)
-            );
-            CREATE INDEX IF NOT EXISTS idx_cochange_a ON cochange(file_a);
-            CREATE INDEX IF NOT EXISTS idx_cochange_b ON cochange(file_b);
-            ",
-        )?;
-        self.vector_store
-            .create_schema(&conn, self.config.embedding_dimensions)?;
-        migrate_cochange_recency(&conn)?;
-        debug!(db_path = %self.db_path.display(), "LoomDb schema initialized");
-        Ok(())
-    }
-
     fn reader(&self) -> Result<r2d2::PooledConnection<SqliteConnectionManager>> {
         let conn = self.readers.get()?;
         apply_pragmas(&conn)?;
@@ -945,17 +913,4 @@ fn checked_sql_limit(limit: usize) -> Result<i64> {
         )));
     }
     i64::try_from(limit).map_err(|_| LoomError::InvalidInput("limit is too large".to_string()))
-}
-
-fn migrate_cochange_recency(conn: &Connection) -> Result<()> {
-    let mut stmt = conn.prepare("PRAGMA table_info(cochange)")?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
-    let columns = collect_rows(rows)?;
-    if !columns.iter().any(|column| column == "recency") {
-        conn.execute(
-            "ALTER TABLE cochange ADD COLUMN recency REAL NOT NULL DEFAULT 0.0",
-            [],
-        )?;
-    }
-    Ok(())
 }

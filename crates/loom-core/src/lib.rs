@@ -10,7 +10,7 @@ pub mod search;
 pub mod store;
 pub mod watcher;
 
-pub use config::LoomConfig;
+pub use config::{EmbeddingBackendConfig, LoomConfig, VectorBackendConfig};
 pub use embedder::{
     build_symbol_text, CandleEmbedder, DefaultEmbedder, Embedder, HashingEmbedder, ModelSource,
 };

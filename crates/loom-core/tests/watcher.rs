@@ -65,7 +65,12 @@ fn debouncer_queues_create_delete_and_move_destination() {
 
     assert_eq!(
         debouncer.pending_paths(),
-        vec![file, dir.path().join("gone.py"), moved]
+        vec![
+            file,
+            dir.path().join("gone.py"),
+            moved,
+            dir.path().join("old.py")
+        ]
     );
 }
 
