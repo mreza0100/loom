@@ -126,6 +126,9 @@ def _walk_node(
                     in_function=in_function,
                 )
 
+    elif node.type == "expression_statement":
+        _handle_expression_statement(node, source, file_path, language, symbols, edges)
+
     elif node.type == "export_statement":
         for child in node.children:
             _walk_node(child, source, file_path, language, symbols, edges, in_function=False)
@@ -150,6 +153,11 @@ def _handle_variable_declarator(
     *,
     in_function: bool = False,
 ) -> None:
+    # Check for require() — CommonJS import: const X = require("./path")
+    require_info = _extract_require(node, source)
+    if require_info:
+        _handle_require_declaration(node, source, file_path, require_info, edges)
+
     name = _extract_name(node, source)
     if not name:
         return
@@ -183,6 +191,116 @@ def _handle_variable_declarator(
 
     if value:
         _extract_calls(value, source, name, file_path, edges)
+
+
+def _extract_require(node: Node, source: bytes) -> str | None:
+    """If node is a variable_declarator with require("..."), return the module path."""
+    for child in node.children:
+        if child.type == "call_expression":
+            func = child.children[0] if child.children else None
+            if func and func.type == "identifier":
+                func_name = source[func.start_byte : func.end_byte].decode()
+                if func_name == "require":
+                    args = child.child_by_field_name("arguments")
+                    if args is None:
+                        for c in child.children:
+                            if c.type == "arguments":
+                                args = c
+                                break
+                    if args:
+                        for arg in args.children:
+                            if arg.type == "string":
+                                raw = source[arg.start_byte : arg.end_byte].decode()
+                                return raw.strip("'\"")
+    return None
+
+
+def _handle_require_declaration(
+    node: Node,
+    source: bytes,
+    file_path: str,
+    module_path: str,
+    edges: list[ParsedEdge],
+) -> None:
+    """Handle const X = require("./path") and const { X, Y } = require("./path")."""
+    lhs = node.children[0] if node.children else None
+    if lhs is None:
+        return
+
+    if lhs.type == "identifier":
+        # const X = require("./path") — default import
+        name = source[lhs.start_byte : lhs.end_byte].decode()
+        edges.append(
+            ParsedEdge(
+                source_name=name,
+                target_name=name,
+                target_file=module_path,
+                relationship="imports",
+            ),
+        )
+    elif lhs.type == "object_pattern":
+        # const { X, Y as Z } = require("./path") — named imports
+        for child in lhs.children:
+            if child.type == "shorthand_property_identifier_pattern":
+                name = source[child.start_byte : child.end_byte].decode()
+                edges.append(
+                    ParsedEdge(
+                        source_name=name,
+                        target_name=name,
+                        target_file=module_path,
+                        relationship="imports",
+                    ),
+                )
+            elif child.type == "pair_pattern":
+                # { original: alias }
+                ids = [
+                    source[c.start_byte : c.end_byte].decode()
+                    for c in child.children
+                    if c.type in ("identifier", "shorthand_property_identifier_pattern")
+                ]
+                if len(ids) == 2:
+                    edges.append(
+                        ParsedEdge(
+                            source_name=ids[1],
+                            target_name=ids[0],
+                            target_file=module_path,
+                            relationship="imports",
+                        ),
+                    )
+
+
+def _handle_expression_statement(
+    node: Node,
+    source: bytes,
+    file_path: str,
+    language: str,
+    symbols: list[Symbol],
+    edges: list[ParsedEdge],
+) -> None:
+    """Handle module.exports.X = expr — CommonJS named exports."""
+    for child in node.children:
+        if child.type != "assignment_expression":
+            continue
+        lhs = child.children[0] if child.children else None
+        if lhs is None or lhs.type != "member_expression":
+            continue
+        lhs_text = source[lhs.start_byte : lhs.end_byte].decode()
+        if not lhs_text.startswith("module.exports."):
+            continue
+        export_name = lhs_text[len("module.exports.") :]
+        if not export_name.isidentifier():
+            continue
+        symbols.append(
+            Symbol(
+                name=export_name,
+                kind="variable",
+                file=file_path,
+                line=node.start_point[0] + 1,
+                end_line=node.end_point[0] + 1,
+                language=language,
+                context=_get_context(source, node),
+            ),
+        )
 
 
 def _extract_import_specifier(node: Node, source: bytes) -> tuple[str | None, str | None]:

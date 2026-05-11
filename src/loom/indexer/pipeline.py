@@ -247,7 +247,14 @@ class IndexPipeline:
           - target_name = local binding name (import map key)
           - target_file = resolved path to the target module (normalized by _parse_all_files)
           - original_name = exported name in target module (differs from local_name for aliases)
+
+        For CommonJS require() paths without extensions (e.g. "./Cache"),
+        resolves to actual indexed files by trying common extensions.
         """
+        known_files: set[str] = {
+            row[0] for row in self._db.conn.execute("SELECT DISTINCT file FROM symbols").fetchall()
+        }
+
         rows = self._db.conn.execute(
             "SELECT e.target_name, s.file, e.target_file, e.original_name "
             "FROM edges e "
@@ -257,8 +264,28 @@ class IndexPipeline:
 
         import_map: dict[tuple[str, str], tuple[str, str | None]] = {}
         for local_name, source_file, target_file, original_name in rows:
-            import_map[(source_file, local_name)] = (target_file, original_name)
+            resolved = self._resolve_module_file(target_file, known_files)
+            import_map[(source_file, local_name)] = (resolved, original_name)
         return import_map
+
+    @staticmethod
+    def _resolve_module_file(target_file: str, known_files: set[str]) -> str:
+        """Resolve a module path to an actual indexed file.
+
+        Tries the path as-is first, then appends common JS/TS extensions,
+        then tries index files. Returns the original path if no match found.
+        """
+        if target_file in known_files:
+            return target_file
+        for ext in (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"):
+            candidate = target_file + ext
+            if candidate in known_files:
+                return candidate
+        for index in ("index.js", "index.ts"):
+            candidate = f"{target_file}/{index}"
+            if candidate in known_files:
+                return candidate
+        return target_file
 
     def _resolve_single_edge(
         self,
