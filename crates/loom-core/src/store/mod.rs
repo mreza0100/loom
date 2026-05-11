@@ -257,6 +257,7 @@ impl LoomDb {
         content_hash: &str,
         symbols: &[Symbol],
         embeddings: &[Vec<f32>],
+        embedding_fingerprint: &str,
         build_edges: F,
     ) -> Result<(usize, usize)>
     where
@@ -338,7 +339,7 @@ impl LoomDb {
             "INSERT OR REPLACE INTO index_meta
              (file_path, content_hash, embedding_fingerprint)
              VALUES (?, ?, ?)",
-            params![path, content_hash, self.config.embedding_fingerprint()],
+            params![path, content_hash, embedding_fingerprint],
         )?;
         tx.commit()?;
         Ok((symbols.len(), edges.len()))
@@ -551,13 +552,16 @@ impl LoomDb {
         .map_err(LoomError::from)
     }
 
-    pub fn file_index_is_fresh(&self, path: &str, content_hash: &str) -> Result<bool> {
+    pub fn file_index_is_fresh(
+        &self,
+        path: &str,
+        content_hash: &str,
+        embedding_fingerprint: &str,
+    ) -> Result<bool> {
         if self.get_file_hash(path)?.as_deref() != Some(content_hash) {
             return Ok(false);
         }
-        if self.get_embedding_fingerprint(path)?.as_deref()
-            != Some(self.config.embedding_fingerprint().as_str())
-        {
+        if self.get_embedding_fingerprint(path)?.as_deref() != Some(embedding_fingerprint) {
             return Ok(false);
         }
         let conn = self.reader()?;

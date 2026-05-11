@@ -157,7 +157,9 @@ fn old_schema_without_recency_upgrades_idempotently() {
     let cochange = db.get_cochange("a.py", "b.py").unwrap().unwrap();
     assert_eq!(cochange.frequency, 3);
     assert_eq!(cochange.recency, 0.0);
-    assert!(!db.file_index_is_fresh("legacy.py", "abc").unwrap());
+    assert!(!db
+        .file_index_is_fresh("legacy.py", "abc", "embedder=custom;dims=768")
+        .unwrap());
 
     let reopened = LoomDb::open(LoomConfig::default_for_target(temp.path())).unwrap();
     assert_eq!(reopened.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);

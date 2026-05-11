@@ -125,10 +125,14 @@ impl<E: Embedder> IndexPipeline<E> {
     fn index_paths(&self, files: Vec<PathBuf>) -> Result<IndexResult> {
         let mut result = IndexResult::default();
         let mut jobs = Vec::new();
+        let embedding_fingerprint = self.embedder.fingerprint();
         for file in files {
             let db_path = path::db_path_for(&file, &self.config)?;
             let content_hash = walk::hash_file(&file)?;
-            if self.db.file_index_is_fresh(&db_path, &content_hash)? {
+            if self
+                .db
+                .file_index_is_fresh(&db_path, &content_hash, &embedding_fingerprint)?
+            {
                 result.skipped += 1;
                 continue;
             }
@@ -210,6 +214,7 @@ impl<E: Embedder> IndexPipeline<E> {
             &parsed_file.content_hash,
             &symbols,
             &embeddings,
+            &self.embedder.fingerprint(),
             |symbol_ids| {
                 let mut local_name_to_id = BTreeMap::new();
                 for (symbol, symbol_id) in symbols.iter().zip(symbol_ids.iter()) {

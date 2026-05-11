@@ -111,4 +111,9 @@ fn default_embedder_explicit_fallback_reports_degraded_hashing() {
     assert_eq!(status.backend, "hashing");
     assert!(status.degraded);
     assert_eq!(status.dimensions, 8);
+    assert_eq!(
+        embedder.fingerprint(),
+        "embedder=hashing;degraded=true;model=none;dims=8"
+    );
+    assert_ne!(embedder.fingerprint(), config.embedding_fingerprint());
 }

@@ -134,7 +134,7 @@ fn full_index_rebuilds_vectors_when_backend_changes() {
     assert_eq!(rebuilt.skipped, 0);
     assert_eq!(sqlite_db.get_stats().unwrap().vectors, 1);
     assert!(sqlite_db
-        .file_index_is_fresh("app.py", &walk_hash(&file))
+        .file_index_is_fresh("app.py", &walk_hash(&file), &mock_fingerprint(3))
         .unwrap());
 }
 
@@ -154,7 +154,9 @@ fn full_index_rebuilds_vectors_when_embedding_fingerprint_changes() {
         Arc::new(MockEmbedder { dimensions: 3 }),
     );
     assert_eq!(first_pipeline.full_index().unwrap().indexed, 1);
-    assert!(db.file_index_is_fresh("app.py", &walk_hash(&file)).unwrap());
+    assert!(db
+        .file_index_is_fresh("app.py", &walk_hash(&file), &mock_fingerprint(3))
+        .unwrap());
 
     let mut second_config = LoomConfig::default_for_target(dir.path());
     second_config.embedding_dimensions = 4;
@@ -162,7 +164,7 @@ fn full_index_rebuilds_vectors_when_embedding_fingerprint_changes() {
     second_config.vector_backend = VectorBackendConfig::Blob;
     let reopened = Arc::new(LoomDb::open(second_config.clone()).unwrap());
     assert!(!reopened
-        .file_index_is_fresh("app.py", &walk_hash(&file))
+        .file_index_is_fresh("app.py", &walk_hash(&file), &mock_fingerprint(4))
         .unwrap());
     let second_pipeline = IndexPipeline::new(
         second_config,
@@ -176,7 +178,7 @@ fn full_index_rebuilds_vectors_when_embedding_fingerprint_changes() {
     assert_eq!(rebuilt.skipped, 0);
     assert_eq!(reopened.get_stats().unwrap().vectors, 1);
     assert!(reopened
-        .file_index_is_fresh("app.py", &walk_hash(&file))
+        .file_index_is_fresh("app.py", &walk_hash(&file), &mock_fingerprint(4))
         .unwrap());
 }
 
@@ -207,6 +209,10 @@ fn incremental_delete_removes_symbols_vectors_and_hash() {
 
 fn walk_hash(path: &std::path::Path) -> String {
     loom_core::indexer::walk::hash_file(path).unwrap()
+}
+
+fn mock_fingerprint(dimensions: usize) -> String {
+    MockEmbedder { dimensions }.fingerprint()
 }
 
 #[test]

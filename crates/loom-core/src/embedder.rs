@@ -27,6 +27,10 @@ pub trait Embedder: Send + Sync {
     }
 
     fn dimensions(&self) -> usize;
+
+    fn fingerprint(&self) -> String {
+        format!("embedder=custom;dims={}", self.dimensions())
+    }
 }
 
 pub trait ModelSource: Send + Sync {
@@ -97,6 +101,18 @@ impl DefaultEmbedder {
             },
         }
     }
+
+    #[must_use]
+    pub fn fingerprint(&self) -> String {
+        let status = self.status();
+        format!(
+            "embedder={};degraded={};model={};dims={}",
+            status.backend,
+            status.degraded,
+            status.model.as_deref().unwrap_or("none"),
+            status.dimensions
+        )
+    }
 }
 
 impl Embedder for DefaultEmbedder {
@@ -112,6 +128,10 @@ impl Embedder for DefaultEmbedder {
             Self::Candle(embedder) => embedder.dimensions(),
             Self::Hashing { embedder, .. } => embedder.dimensions(),
         }
+    }
+
+    fn fingerprint(&self) -> String {
+        DefaultEmbedder::fingerprint(self)
     }
 }
 
@@ -155,6 +175,13 @@ impl Embedder for HashingEmbedder {
 
     fn dimensions(&self) -> usize {
         self.dimensions
+    }
+
+    fn fingerprint(&self) -> String {
+        format!(
+            "embedder=hashing;degraded=false;model=none;dims={}",
+            self.dimensions
+        )
     }
 }
 
