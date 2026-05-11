@@ -26,9 +26,7 @@ CREATE TABLE IF NOT EXISTS symbols (
 CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
 CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file);
 
-DROP TABLE IF EXISTS edges;
-
-CREATE TABLE edges (
+CREATE TABLE IF NOT EXISTS edges (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     source_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
     target_id INTEGER REFERENCES symbols(id) ON DELETE SET NULL,
@@ -78,7 +76,7 @@ def _sanitize_fts_query(query: str) -> str:
     tokens = stripped.split()
     quoted: list[str] = []
     for token in tokens:
-        if token.upper() in _FTS5_SPECIAL or any(c in token for c in '-*"^:'):
+        if token.upper() in _FTS5_SPECIAL or any(c in token for c in '-*"^:.'):
             quoted.append(f'"{token}"')
         else:
             quoted.append(token)

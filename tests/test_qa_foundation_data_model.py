@@ -794,8 +794,8 @@ class TestEngineUnresolvedEdgeHandling:
 class TestSchemaDropRecreate:
     """Verify DROP TABLE IF EXISTS edges behavior on reconnect."""
 
-    def test_reconnect_drops_edges_table(self, config: LoomConfig) -> None:
-        """On reconnect, the edges table is dropped and recreated."""
+    def test_reconnect_preserves_edges_table(self, config: LoomConfig) -> None:
+        """On reconnect, edges persist (CREATE TABLE IF NOT EXISTS)."""
         db = LoomDB(config)
         db.connect()
 
@@ -831,9 +831,7 @@ class TestSchemaDropRecreate:
         db.connect()
 
         edges_after = db.conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
-        assert edges_after == 0, (
-            "Edges table should be empty after reconnect (DROP TABLE IF EXISTS)"
-        )
+        assert edges_after == 1, "Edges must persist across reconnects"
 
         syms_after = db.conn.execute("SELECT COUNT(*) FROM symbols").fetchone()[0]
         assert syms_after == 2, "Symbols table must persist across reconnects"

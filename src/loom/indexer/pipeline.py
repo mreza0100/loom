@@ -319,6 +319,27 @@ class IndexPipeline:
                 if len(candidates) == 1 and candidates[0].id is not None:
                     return (candidates[0].id, 0.95)
 
+        # Strategy 2b: this.X same-file resolution
+        # In JS/TS, this.method always refers to a method on the enclosing class
+        if base == "this" and len(parts) >= 2:
+            method = ".".join(parts[1:])
+            # Try ClassName.method in the same file (source symbol's class prefix)
+            source_class = source_sym.name.split(".")[0] if "." in source_sym.name else None
+            if source_class:
+                qualified = f"{source_class}.{method}"
+                candidates = self._db.get_symbol_by_name(qualified, source_file)
+                if len(candidates) == 1 and candidates[0].id is not None:
+                    return (candidates[0].id, 0.95)
+            # Fallback: any *.method in same file
+            same_file_rows = self._db.conn.execute(
+                "SELECT id, name, kind, file, line, end_line, language, context "
+                "FROM symbols WHERE file = ? AND name LIKE ?",
+                (source_file, f"%.{method}"),
+            ).fetchall()
+            same_file_matches = [self._db._row_to_symbol(r) for r in same_file_rows]  # noqa: SLF001
+            if len(same_file_matches) == 1 and same_file_matches[0].id is not None:
+                return (same_file_matches[0].id, 0.9)
+
         # Strategy 3: File suffix match (target_file is partial path)
         if target_file and import_entry is None:
             # Normalize the suffix for matching
