@@ -53,6 +53,16 @@ CREATE TABLE IF NOT EXISTS index_meta (
 CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
     name, kind, file, context, content=symbols, content_rowid=id
 );
+
+CREATE TABLE IF NOT EXISTS cochange (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_a TEXT NOT NULL,
+    file_b TEXT NOT NULL,
+    frequency INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(file_a, file_b)
+);
+CREATE INDEX IF NOT EXISTS idx_cochange_a ON cochange(file_a);
+CREATE INDEX IF NOT EXISTS idx_cochange_b ON cochange(file_b);
 """
 
 VEC_SCHEMA = "CREATE VIRTUAL TABLE IF NOT EXISTS vec_symbols USING vec0(embedding float[{dims}])"
@@ -370,6 +380,50 @@ class LoomDB:
         ).fetchall()
         return [self._row_to_symbol(r) for r in rows]
 
+    # --- Co-change (evolutionary coupling) ---
+
+    def upsert_cochange(self, file_a: str, file_b: str, frequency: int) -> None:
+        """Insert or update a co-change pair.
+
+        Enforces canonical (min, max) ordering at the DB layer regardless of
+        argument order — prevents duplicate rows for (a, b) vs (b, a).
+        Uses INSERT ... ON CONFLICT DO UPDATE to replace the stored frequency
+        with the new authoritative count from the latest full git analysis.
+        """
+        a, b = (min(file_a, file_b), max(file_a, file_b))
+        self.conn.execute(
+            "INSERT INTO cochange (file_a, file_b, frequency) VALUES (?, ?, ?) "
+            "ON CONFLICT(file_a, file_b) DO UPDATE SET frequency = excluded.frequency",
+            (a, b, frequency),
+        )
+
+    def get_cochange_frequency(self, file_a: str, file_b: str) -> int:
+        """Return stored co-change frequency for a file pair.
+
+        Returns 0 if no row exists (correct default for evolutionary score = 0.0).
+        Normalizes to (min, max) ordering before querying.
+        """
+        a, b = (min(file_a, file_b), max(file_a, file_b))
+        row = self.conn.execute(
+            "SELECT frequency FROM cochange WHERE file_a = ? AND file_b = ?",
+            (a, b),
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    def get_top_cochanges(self, file: str, limit: int = 20) -> list[tuple[str, int]]:
+        """Return top co-changed partner files for the given file, sorted by frequency desc.
+
+        Uses a CASE expression to return the partner path regardless of which column
+        holds the queried file.
+        """
+        rows = self.conn.execute(
+            "SELECT CASE WHEN file_a = ? THEN file_b ELSE file_a END AS other_file, frequency "
+            "FROM cochange WHERE file_a = ? OR file_b = ? "
+            "ORDER BY frequency DESC LIMIT ?",
+            (file, file, file, limit),
+        ).fetchall()
+        return [(row[0], int(row[1])) for row in rows]
+
     # --- Stats ---
 
     def get_stats(self) -> dict[str, int | str | None]:
@@ -384,6 +438,7 @@ class LoomDB:
             "SELECT COUNT(*) FROM index_meta WHERE last_indexed < datetime('now', '-1 hour')",
         ).fetchone()
         stale_count = stale_row[0] if stale_row else 0
+        cochange_count = self.conn.execute("SELECT COUNT(*) FROM cochange").fetchone()[0]
         return {
             "symbols": symbol_count,
             "edges": edge_count,
@@ -391,6 +446,7 @@ class LoomDB:
             "vectors": vec_count,
             "last_indexed": last_indexed,
             "stale_files": stale_count,
+            "cochange_pairs": cochange_count,
         }
 
     def commit(self) -> None:

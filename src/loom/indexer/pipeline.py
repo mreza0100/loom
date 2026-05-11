@@ -59,6 +59,21 @@ class IndexPipeline:
         result = self._parse_all_files(files)
         resolved = self._resolve_all_edges()
         result["resolved"] = resolved
+
+        if self._config.enable_git_analysis:
+            from loom.indexer.git_analyzer import GitAnalyzer  # noqa: PLC0415
+
+            git = GitAnalyzer(self._config.target_dir, self._config.watch_extensions)
+            if git.is_git_repo():
+                cochanges = git.analyze_cochanges(
+                    max_commits=self._config.git_max_commits,
+                    max_files_per_commit=self._config.git_max_files_per_commit,
+                )
+                for (file_a, file_b), freq in cochanges.items():
+                    self._db.upsert_cochange(file_a, file_b, freq)
+                self._db.commit()
+                log.info("Git analysis: stored %d co-change pairs", len(cochanges))
+
         if self._graph is not None:
             self._graph.build_from_db(self._db)
         return result
