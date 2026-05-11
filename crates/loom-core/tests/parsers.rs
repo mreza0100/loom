@@ -24,7 +24,7 @@ fn registry_and_dispatcher_cover_builtin_extensions() {
     let registry = AdapterRegistry::with_builtin_adapters();
     let extensions = registry.get_all_extensions();
     for extension in [
-        ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".py", ".pyi", ".go", ".java", ".rs", ".cs",
+        ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".go", ".java", ".rs", ".cs",
     ] {
         assert!(
             extensions.contains(extension),
@@ -35,7 +35,7 @@ fn registry_and_dispatcher_cover_builtin_extensions() {
     assert!(registry.get_adapter(".txt").is_none());
 
     let excluded = registry.get_all_excluded_dirs();
-    for directory in ["node_modules", ".venv", "vendor", "target", "bin"] {
+    for directory in ["node_modules", "vendor", "target", "bin"] {
         assert!(excluded.contains(directory));
     }
 
@@ -53,8 +53,8 @@ fn registry_and_dispatcher_cover_builtin_extensions() {
 fn dispatcher_reads_source_from_disk_when_needed() {
     let registry = AdapterRegistry::with_builtin_adapters();
     let dir = tempdir().expect("tempdir");
-    let path = dir.path().join("sample.py");
-    fs::write(&path, "def loaded():\n    return 1\n").expect("write fixture");
+    let path = dir.path().join("sample.ts");
+    fs::write(&path, "function loaded() {\n  return 1;\n}\n").expect("write fixture");
 
     let result = parse_file(&path, None, &registry).expect("parse");
 
@@ -99,27 +99,6 @@ interface Contract extends Parent {}
         .any(|edge| edge.target_name == "console.log" && edge.relationship == "calls"));
     assert!(has_edge(&result, "run", "Widget", "instantiates"));
     assert!(has_edge(&result, "Service", "Base", "extends"));
-}
-
-#[test]
-fn python_extracts_defs_imports_bases_calls_and_partial_malformed_source() {
-    let registry = AdapterRegistry::with_builtin_adapters();
-    let source = b"\xef\xbb\xbffrom .models import Base as ModelBase\nimport os.path as osp\nCONSTANT = 1\n@dataclass\nclass User(ModelBase):\n    def __init__(self):\n        self.save()\n        Widget()\ndef top():\n    helper()\nclass Broken(";
-
-    let result =
-        parse_file(std::path::Path::new("sample.py"), Some(source), &registry).expect("parse");
-
-    let symbol_names = names(&result);
-    for expected in ["CONSTANT", "User", "User.__init__", "top"] {
-        assert!(symbol_names.contains(expected), "missing {expected}");
-    }
-    assert!(
-        has_edge(&result, "ModelBase", "Base", "imports")
-            || has_edge(&result, "Base", "Base", "imports")
-    );
-    assert!(has_edge(&result, "User", "ModelBase", "extends"));
-    assert!(has_edge(&result, "User.__init__", "self.save", "calls"));
-    assert!(has_edge(&result, "User.__init__", "Widget", "instantiates"));
 }
 
 #[test]
@@ -237,24 +216,16 @@ fn adapter_module_resolution_is_deterministic() {
     let registry = AdapterRegistry::with_builtin_adapters();
     let known = BTreeSet::from([
         "src/product.ts".to_string(),
-        "pkg/models.py".to_string(),
-        "pkg/__init__.py".to_string(),
         "foo/bar.rs".to_string(),
         "foo/bar/mod.rs".to_string(),
         "com/example/Foo.java".to_string(),
         "util/file.go".to_string(),
     ]);
 
-    let js = registry.get_adapter(".ts").expect("js adapter");
+    let js = registry.get_adapter(".ts").expect("ts adapter");
     assert_eq!(
         js.resolve_module_path("src/product", "src/main.ts", &known),
         "src/product.ts"
-    );
-
-    let py = registry.get_adapter(".py").expect("python adapter");
-    assert_eq!(
-        py.resolve_module_path("pkg.models", "app/main.py", &known),
-        "pkg/models.py"
     );
 
     let rust = registry.get_adapter(".rs").expect("rust adapter");

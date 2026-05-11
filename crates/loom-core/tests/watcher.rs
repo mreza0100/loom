@@ -23,8 +23,8 @@ impl ChangeHandler for RecordingHandler {
 #[test]
 fn debouncer_dedupes_same_content_modify_and_flushes_batch() {
     let dir = tempdir().unwrap();
-    let file = dir.path().join("app.py");
-    fs::write(&file, "def alpha():\n    return 1\n").unwrap();
+    let file = dir.path().join("app.ts");
+    fs::write(&file, "function alpha() {\n  return 1;\n}\n").unwrap();
     let mut config = LoomConfig::default_for_target(dir.path());
     config.debounce_seconds = 0.0;
     let handler = Arc::new(RecordingHandler::default());
@@ -43,10 +43,10 @@ fn debouncer_dedupes_same_content_modify_and_flushes_batch() {
 #[test]
 fn debouncer_queues_create_delete_and_move_destination() {
     let dir = tempdir().unwrap();
-    let file = dir.path().join("created.py");
-    let moved = dir.path().join("moved.py");
-    fs::write(&file, "def alpha():\n    return 1\n").unwrap();
-    fs::write(&moved, "def beta():\n    return 2\n").unwrap();
+    let file = dir.path().join("created.ts");
+    let moved = dir.path().join("moved.ts");
+    fs::write(&file, "function alpha() {\n  return 1;\n}\n").unwrap();
+    fs::write(&moved, "function beta() {\n  return 2;\n}\n").unwrap();
     let handler = Arc::new(RecordingHandler::default());
     let mut debouncer =
         Debouncer::new(LoomConfig::default_for_target(dir.path()), handler).unwrap();
@@ -58,18 +58,18 @@ fn debouncer_queues_create_delete_and_move_destination() {
     });
     debouncer.handle_event(Event {
         kind: EventKind::Modify(ModifyKind::Name(notify::event::RenameMode::Both)),
-        paths: vec![dir.path().join("old.py"), moved.clone()],
+        paths: vec![dir.path().join("old.ts"), moved.clone()],
         attrs: Default::default(),
     });
-    debouncer.enqueue_deleted(dir.path().join("gone.py"));
+    debouncer.enqueue_deleted(dir.path().join("gone.ts"));
 
     assert_eq!(
         debouncer.pending_paths(),
         vec![
             file,
-            dir.path().join("gone.py"),
+            dir.path().join("gone.ts"),
             moved,
-            dir.path().join("old.py")
+            dir.path().join("old.ts")
         ]
     );
 }
@@ -79,17 +79,21 @@ fn debouncer_ignores_excluded_dirs_unsupported_extensions_and_loomignore() {
     let dir = tempdir().unwrap();
     fs::write(dir.path().join(".loomignore"), "ignored/**\n").unwrap();
     fs::create_dir(dir.path().join("ignored")).unwrap();
-    fs::write(dir.path().join("ignored/app.py"), "def ignored(): pass\n").unwrap();
+    fs::write(dir.path().join("ignored/app.ts"), "function ignored() {}\n").unwrap();
     fs::write(dir.path().join("notes.txt"), "not code\n").unwrap();
     fs::create_dir(dir.path().join("node_modules")).unwrap();
-    fs::write(dir.path().join("node_modules/app.py"), "def nope(): pass\n").unwrap();
+    fs::write(
+        dir.path().join("node_modules/app.ts"),
+        "function nope() {}\n",
+    )
+    .unwrap();
     let handler = Arc::new(RecordingHandler::default());
     let mut debouncer =
         Debouncer::new(LoomConfig::default_for_target(dir.path()), handler).unwrap();
 
-    debouncer.force_enqueue(dir.path().join("ignored/app.py"));
+    debouncer.force_enqueue(dir.path().join("ignored/app.ts"));
     debouncer.force_enqueue(dir.path().join("notes.txt"));
-    debouncer.force_enqueue(dir.path().join("node_modules/app.py"));
+    debouncer.force_enqueue(dir.path().join("node_modules/app.ts"));
 
     assert!(debouncer.pending_paths().is_empty());
 }

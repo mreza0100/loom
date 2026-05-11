@@ -1,7 +1,9 @@
 use loom_core::config::LoomConfig;
 use loom_core::graph::SymbolGraph;
 use loom_core::models::{
-    CoupledSymbol, CouplingScore, Edge, FileState, ParsedEdge, SearchResult, Symbol,
+    file_handle, response_budget, response_envelope, symbol_handle, CoupledSymbol, CouplingScore,
+    Edge, FileAnchor, FileState, LexicalEvidence, ParsedEdge, SearchResponse, SearchResult, Symbol,
+    SymbolHit, SEARCH_CONTRACT,
 };
 use loom_core::store::{
     migrations::CURRENT_SCHEMA_VERSION, sanitize_fts_query, LoomDb, ReaderPragma,
@@ -19,8 +21,8 @@ fn symbol(name: &str, file: &str, line: i64) -> Symbol {
         file: file.to_string(),
         line,
         end_line: line + 3,
-        language: "python".to_string(),
-        context: format!("def {name}(): ..."),
+        language: "typescript".to_string(),
+        context: format!("function {name}() {{}}"),
     }
 }
 
@@ -67,10 +69,13 @@ fn config_defaults_and_missing_toml_fallback() {
     assert!(!loaded.allow_hashing_embedder_fallback);
     assert!(loaded.excluded_dirs.contains(".git"));
     assert!(loaded.watch_extensions.contains(".rs"));
-    assert_eq!(
-        loaded.watch_extensions,
-        AdapterRegistry::with_builtin_adapters().get_all_extensions()
+    let mut expected_extensions = AdapterRegistry::with_builtin_adapters().get_all_extensions();
+    expected_extensions.extend(
+        [".json", ".toml", ".yaml", ".yml"]
+            .into_iter()
+            .map(String::from),
     );
+    assert_eq!(loaded.watch_extensions, expected_extensions);
     for excluded in AdapterRegistry::with_builtin_adapters().get_all_excluded_dirs() {
         assert!(loaded.excluded_dirs.contains(&excluded));
     }
@@ -145,8 +150,8 @@ fn old_schema_without_recency_upgrades_idempotently() {
             content_hash TEXT NOT NULL,
             last_indexed TEXT NOT NULL DEFAULT (datetime('now'))
         );
-        INSERT INTO cochange (file_a, file_b, frequency) VALUES ('a.py', 'b.py', 3);
-        INSERT INTO index_meta (file_path, content_hash) VALUES ('legacy.py', 'abc');
+        INSERT INTO cochange (file_a, file_b, frequency) VALUES ('a.ts', 'b.ts', 3);
+        INSERT INTO index_meta (file_path, content_hash) VALUES ('legacy.ts', 'abc');
         ",
     )
     .unwrap();
@@ -154,11 +159,11 @@ fn old_schema_without_recency_upgrades_idempotently() {
 
     let db = LoomDb::open(LoomConfig::default_for_target(temp.path())).unwrap();
     assert_eq!(db.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
-    let cochange = db.get_cochange("a.py", "b.py").unwrap().unwrap();
+    let cochange = db.get_cochange("a.ts", "b.ts").unwrap().unwrap();
     assert_eq!(cochange.frequency, 3);
     assert_eq!(cochange.recency, 0.0);
     assert!(!db
-        .file_index_is_fresh("legacy.py", "abc", "embedder=custom;dims=768")
+        .file_index_is_fresh("legacy.ts", "abc", "embedder=custom;dims=768")
         .unwrap());
 
     let reopened = LoomDb::open(LoomConfig::default_for_target(temp.path())).unwrap();
@@ -192,16 +197,16 @@ fn config_invalid_toml_and_invalid_weights() {
 
 #[test]
 fn model_serde_round_trips() {
-    let sym = symbol("resolve_session", "src/session.py", 7);
+    let sym = symbol("resolve_session", "src/session.ts", 7);
     let parsed = ParsedEdge {
         source_name: "resolve_session".to_string(),
         target_name: "SessionValidator".to_string(),
         relationship: "calls".to_string(),
-        target_file: Some("src/session.py".to_string()),
+        target_file: Some("src/session.ts".to_string()),
     };
     let edge = edge(1, Some(2), "SessionValidator", 0.9);
     let file_state = FileState {
-        path: "src/session.py".to_string(),
+        path: "src/session.ts".to_string(),
         content_hash: "abc".to_string(),
         last_indexed: "2026-05-11T00:00:00Z".to_string(),
     };
@@ -249,6 +254,65 @@ fn model_serde_round_trips() {
 }
 
 #[test]
+fn search_response_contract_json_shape_is_versioned() {
+    let mut sym = symbol("resolve_session", "src/session.ts", 7);
+    sym.id = Some(42);
+    let revision = "idx-testrev".to_string();
+    let handle = symbol_handle(&revision, &sym);
+    let file_handle = file_handle(&revision, &sym.file);
+    let hit = SymbolHit {
+        handle: handle.clone(),
+        file_handle: file_handle.clone(),
+        rank: 1,
+        name: sym.name.clone(),
+        kind: sym.kind.clone(),
+        language: sym.language.clone(),
+        anchor: FileAnchor::from_symbol(&sym),
+        summary: "function resolve_session() {}".to_string(),
+        symbol: sym,
+        score: 0.91,
+        reason_codes: vec!["exact:name".to_string(), "semantic".to_string()],
+        lexical_evidence: Some(LexicalEvidence {
+            snippet: "function resolve_session()".to_string(),
+            matched_text: "resolve_session".to_string(),
+            rank: -0.1,
+            field: "name".to_string(),
+            reason: "fts:name".to_string(),
+            match_kind: "token_match".to_string(),
+            sanitized_query: "resolve_session".to_string(),
+        }),
+        coupled: Vec::new(),
+    };
+    let envelope = response_envelope(SEARCH_CONTRACT, revision.clone(), 10, false, true);
+    let response = SearchResponse {
+        contract: envelope.contract,
+        version: envelope.version,
+        index_revision: envelope.index_revision,
+        limit: envelope.limit,
+        truncated: envelope.truncated,
+        inspect_required: envelope.inspect_required,
+        budget: response_budget("results", 10, 1, 0, false),
+        exact_hits: vec![hit],
+        beyond_grep: Vec::new(),
+    };
+    let json = serde_json::to_value(&response).unwrap();
+
+    assert_eq!(json["contract"], SEARCH_CONTRACT);
+    assert_eq!(json["version"], 1);
+    assert_eq!(json["index_revision"], revision);
+    assert_eq!(json["limit"], 10);
+    assert_eq!(json["truncated"], false);
+    assert_eq!(json["inspect_required"], true);
+    assert_eq!(json["exact_hits"][0]["handle"], handle);
+    assert_eq!(json["exact_hits"][0]["file_handle"], file_handle);
+    assert_eq!(json["exact_hits"][0]["rank"], 1);
+    assert_eq!(json["exact_hits"][0]["anchor"]["file"], "src/session.ts");
+    assert!(json["exact_hits"][0].get("symbol").is_none());
+    assert_eq!(json["exact_hits"][0]["lexical_evidence"]["field"], "name");
+    assert_eq!(json["beyond_grep"].as_array().unwrap().len(), 0);
+}
+
+#[test]
 fn schema_pragmas_and_symbol_edge_crud() {
     let (_temp, db) = temp_db();
     assert_eq!(
@@ -262,8 +326,8 @@ fn schema_pragmas_and_symbol_edge_crud() {
         "wal"
     );
 
-    let source_id = db.insert_symbol(&symbol("caller", "src/a.py", 1)).unwrap();
-    let target_id = db.insert_symbol(&symbol("target", "src/b.py", 2)).unwrap();
+    let source_id = db.insert_symbol(&symbol("caller", "src/a.ts", 1)).unwrap();
+    let target_id = db.insert_symbol(&symbol("target", "src/b.ts", 2)).unwrap();
     let edge_id = db
         .insert_edge(&edge(source_id, Some(target_id), "target", 0.91))
         .unwrap();
@@ -279,8 +343,8 @@ fn schema_pragmas_and_symbol_edge_crud() {
 #[test]
 fn unresolved_edge_resolution_and_remove_edges_for_source() {
     let (_temp, db) = temp_db();
-    let source_id = db.insert_symbol(&symbol("caller", "src/a.py", 1)).unwrap();
-    let target_id = db.insert_symbol(&symbol("target", "src/b.py", 2)).unwrap();
+    let source_id = db.insert_symbol(&symbol("caller", "src/a.ts", 1)).unwrap();
+    let target_id = db.insert_symbol(&symbol("target", "src/b.ts", 2)).unwrap();
     let edge_id = db
         .insert_edge(&edge(source_id, None, "target", 0.0))
         .unwrap();
@@ -301,41 +365,41 @@ fn unresolved_edge_resolution_and_remove_edges_for_source() {
 fn remove_file_cascades_and_nullifies_related_data() {
     let (_temp, db) = temp_db();
     let doomed = db
-        .insert_symbol(&symbol("doomed", "src/dead.py", 1))
+        .insert_symbol(&symbol("doomed", "src/dead.ts", 1))
         .unwrap();
     let caller = db
-        .insert_symbol(&symbol("caller", "src/live.py", 2))
+        .insert_symbol(&symbol("caller", "src/live.ts", 2))
         .unwrap();
     db.insert_edge(&edge(doomed, Some(caller), "caller", 0.7))
         .unwrap();
     db.insert_edge(&edge(caller, Some(doomed), "doomed", 0.8))
         .unwrap();
     db.insert_embedding(doomed, &[0.0; 768]).unwrap();
-    db.set_file_hash("src/dead.py", "hash").unwrap();
+    db.set_file_hash("src/dead.ts", "hash").unwrap();
 
-    db.remove_file("src/dead.py").unwrap();
+    db.remove_file("src/dead.ts").unwrap();
 
     assert!(db.get_symbol_by_id(doomed).unwrap().is_none());
     assert!(db.get_edges_from(doomed).unwrap().is_empty());
     let incoming = db.get_edges_from(caller).unwrap();
     assert_eq!(incoming[0].target_id, None);
     assert_eq!(incoming[0].confidence, 0.0);
-    assert_eq!(db.get_file_hash("src/dead.py").unwrap(), None);
+    assert_eq!(db.get_file_hash("src/dead.ts").unwrap(), None);
     assert_eq!(db.get_stats().unwrap().vectors, 0);
 }
 
 #[test]
 fn fuzzy_lookup_strategies() {
     let (_temp, db) = temp_db();
-    db.insert_symbol(&symbol("Foo.bar", "src/pkg/foo.py", 1))
+    db.insert_symbol(&symbol("Foo.bar", "src/pkg/foo.ts", 1))
         .unwrap();
-    db.insert_symbol(&symbol("_hidden", "src/pkg/hidden.py", 1))
+    db.insert_symbol(&symbol("_hidden", "src/pkg/hidden.ts", 1))
         .unwrap();
-    db.insert_symbol(&symbol("named", "lib/feature.py", 1))
+    db.insert_symbol(&symbol("named", "lib/feature.ts", 1))
         .unwrap();
 
     assert_eq!(
-        db.get_symbol_by_name_fuzzy("named", Some("feature.py"))
+        db.get_symbol_by_name_fuzzy("named", Some("feature.ts"))
             .unwrap()
             .len(),
         1
@@ -357,20 +421,42 @@ fn fuzzy_lookup_strategies() {
 #[test]
 fn fts_sanitization_and_search() {
     let (_temp, db) = temp_db();
-    db.insert_symbol(&symbol("Session.validate", "src/session.py", 1))
+    db.insert_symbol(&symbol("Session.validate", "src/session.ts", 1))
         .unwrap();
-    db.insert_symbol(&symbol("logical_gate", "src/logic.py", 2))
+    db.insert_symbol(&symbol("logical_gate", "src/logic.ts", 2))
         .unwrap();
+    let mut quoted = symbol("quoteCarrier", "src/quote.ts", 3);
+    quoted.context = "const phrase = \"exact phrase\";".to_string();
+    db.insert_symbol(&quoted).unwrap();
 
     assert_eq!(
         sanitize_fts_query("AND Session.validate"),
         "\"AND\" \"Session.validate\""
     );
+    assert_eq!(sanitize_fts_query("!!! ---"), "");
     assert!(db.search_fts("", 10).unwrap().is_empty());
     assert_eq!(
         db.search_fts("Session.validate", 10).unwrap()[0].name,
         "Session.validate"
     );
+    let punct = db.search_fts_with_evidence("Session.validate", 10).unwrap();
+    assert_eq!(punct[0].evidence.field, "name");
+    assert_eq!(punct[0].evidence.reason, "fts:name");
+    assert_eq!(punct[0].evidence.match_kind, "token_match");
+    assert_eq!(punct[0].evidence.sanitized_query, "\"Session.validate\"");
+
+    let quoted = db.search_fts_with_evidence("\"exact phrase\"", 10).unwrap();
+    assert_eq!(quoted[0].symbol.name, "quoteCarrier");
+    assert_eq!(quoted[0].evidence.field, "context");
+    assert_eq!(quoted[0].evidence.match_kind, "exact_phrase");
+    assert!(quoted[0].evidence.snippet.contains("exact phrase"));
+
+    let kind = db.search_fts_with_evidence("function", 10).unwrap();
+    assert!(kind.iter().any(|result| result.evidence.field == "kind"));
+    assert!(kind
+        .windows(2)
+        .all(|pair| pair[0].evidence.rank <= pair[1].evidence.rank));
+    assert!(db.search_fts_with_evidence("!!!", 10).unwrap().is_empty());
     assert_eq!(db.search_fts("AND", 10).unwrap().len(), 0);
     assert!(matches!(
         db.search_fts("Session", 1_001),
@@ -381,8 +467,8 @@ fn fts_sanitization_and_search() {
 #[test]
 fn vector_dimension_mismatch_and_top_k_search() {
     let (_temp, db) = temp_db();
-    let first = db.insert_symbol(&symbol("first", "src/a.py", 1)).unwrap();
-    let second = db.insert_symbol(&symbol("second", "src/b.py", 1)).unwrap();
+    let first = db.insert_symbol(&symbol("first", "src/a.ts", 1)).unwrap();
+    let second = db.insert_symbol(&symbol("second", "src/b.ts", 1)).unwrap();
     assert!(matches!(
         db.insert_embedding(first, &[1.0, 2.0]),
         Err(LoomError::VectorDimension {
@@ -404,35 +490,35 @@ fn vector_dimension_mismatch_and_top_k_search() {
 #[test]
 fn cochange_and_stats() {
     let (_temp, db) = temp_db();
-    db.upsert_cochange("b.py", "a.py", 2).unwrap();
-    db.upsert_cochange("a.py", "c.py", 4).unwrap();
-    db.upsert_cochange("a.py", "b.py", 7).unwrap();
+    db.upsert_cochange("b.ts", "a.ts", 2).unwrap();
+    db.upsert_cochange("a.ts", "c.ts", 4).unwrap();
+    db.upsert_cochange("a.ts", "b.ts", 7).unwrap();
 
-    assert_eq!(db.get_cochange_frequency("a.py", "b.py").unwrap(), 7);
-    assert_eq!(db.get_cochange_frequency("missing.py", "b.py").unwrap(), 0);
+    assert_eq!(db.get_cochange_frequency("a.ts", "b.ts").unwrap(), 7);
+    assert_eq!(db.get_cochange_frequency("missing.ts", "b.ts").unwrap(), 0);
     assert_eq!(
-        db.get_top_cochanges("a.py", 2).unwrap()[0],
-        ("b.py".to_string(), 7)
+        db.get_top_cochanges("a.ts", 2).unwrap()[0],
+        ("b.ts".to_string(), 7)
     );
     assert!(matches!(
-        db.get_top_cochanges("a.py", 1_001),
+        db.get_top_cochanges("a.ts", 1_001),
         Err(LoomError::InvalidInput(_))
     ));
     assert_eq!(db.get_stats().unwrap().cochange_pairs, 2);
 
-    db.replace_cochanges(&[("d.py".to_string(), "a.py".to_string(), 5, 0.2)])
+    db.replace_cochanges(&[("d.ts".to_string(), "a.ts".to_string(), 5, 0.2)])
         .unwrap();
-    assert_eq!(db.get_cochange_frequency("a.py", "b.py").unwrap(), 0);
-    assert_eq!(db.get_cochange_frequency("a.py", "d.py").unwrap(), 5);
+    assert_eq!(db.get_cochange_frequency("a.ts", "b.ts").unwrap(), 0);
+    assert_eq!(db.get_cochange_frequency("a.ts", "d.ts").unwrap(), 5);
     assert_eq!(db.get_stats().unwrap().cochange_pairs, 1);
 }
 
 #[test]
 fn graph_rebuild_traversal_decay_centrality_and_missing_nodes() {
     let (_temp, db) = temp_db();
-    let a = db.insert_symbol(&symbol("a", "a.py", 1)).unwrap();
-    let b = db.insert_symbol(&symbol("b", "b.py", 1)).unwrap();
-    let c = db.insert_symbol(&symbol("c", "c.py", 1)).unwrap();
+    let a = db.insert_symbol(&symbol("a", "a.ts", 1)).unwrap();
+    let b = db.insert_symbol(&symbol("b", "b.ts", 1)).unwrap();
+    let c = db.insert_symbol(&symbol("c", "c.ts", 1)).unwrap();
     db.insert_edge(&edge(a, Some(b), "b", 0.3)).unwrap();
     db.insert_edge(&edge(a, Some(b), "b", 0.9)).unwrap();
     db.insert_edge(&edge(c, Some(a), "a", 0.8)).unwrap();

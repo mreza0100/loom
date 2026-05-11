@@ -17,7 +17,6 @@ fn qa_malformed_and_null_byte_sources_do_not_error() {
     for (path, source) in [
         ("broken.rs", b"fn ok() {}\nfn broken(\0".as_slice()),
         ("broken.tsx", b"export const View = <div>{".as_slice()),
-        ("broken.py", b"class Partial(\0".as_slice()),
         ("broken.go", b"package main\nfunc Broken(".as_slice()),
         ("Broken.java", b"class Broken { void m(".as_slice()),
         ("Broken.cs", b"class Broken { public void M(".as_slice()),
@@ -126,9 +125,9 @@ fn qa_cross_language_empty_and_comment_only_sources_are_empty() {
 
     for (path, source) in [
         ("empty.rs", b"".as_slice()),
-        ("comment.py", b"# only a comment\n".as_slice()),
         ("comment.go", b"// only a comment\n".as_slice()),
         ("comment.js", b"// only a comment\n".as_slice()),
+        ("comment.ts", b"// only a comment\n".as_slice()),
     ] {
         let result = parse_file(std::path::Path::new(path), Some(source), &registry)
             .unwrap_or_else(|error| panic!("{path} should parse: {error}"));

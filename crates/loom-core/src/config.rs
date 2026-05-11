@@ -7,6 +7,7 @@ use std::path::{Component, Path, PathBuf};
 
 const ALWAYS_EXCLUDED: [&str; 3] = [".git", "__pycache__", ".loom"];
 const SUPPORTED_EMBEDDING_MODELS: [&str; 1] = ["jinaai/jina-embeddings-v2-base-code"];
+const SIGNAL_EXTENSIONS: [&str; 4] = [".json", ".toml", ".yaml", ".yml"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -97,7 +98,8 @@ impl LoomConfig {
     #[must_use]
     pub fn default_for_target(target_dir: impl Into<PathBuf>) -> Self {
         let registry = AdapterRegistry::with_builtin_adapters();
-        let watch_extensions = registry.get_all_extensions();
+        let mut watch_extensions = registry.get_all_extensions();
+        Self::union_signal_extensions(&mut watch_extensions);
         let mut excluded_dirs = registry.get_all_excluded_dirs();
         Self::union_always_excluded(&mut excluded_dirs);
 
@@ -321,6 +323,12 @@ impl LoomConfig {
     fn union_always_excluded(excluded_dirs: &mut BTreeSet<String>) {
         for dir in ALWAYS_EXCLUDED {
             excluded_dirs.insert(dir.to_string());
+        }
+    }
+
+    fn union_signal_extensions(watch_extensions: &mut BTreeSet<String>) {
+        for extension in SIGNAL_EXTENSIONS {
+            watch_extensions.insert(extension.to_string());
         }
     }
 }

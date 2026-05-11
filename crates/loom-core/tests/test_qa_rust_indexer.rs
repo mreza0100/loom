@@ -17,8 +17,8 @@ fn symbol(name: &str, file: &str) -> Symbol {
         file: file.to_string(),
         line: 1,
         end_line: 1,
-        language: "python".to_string(),
-        context: format!("def {name}(): pass"),
+        language: "typescript".to_string(),
+        context: format!("function {name}() {{}}"),
     }
 }
 
@@ -53,14 +53,14 @@ fn temp_db_with_dimensions(dimensions: usize) -> (tempfile::TempDir, LoomDb) {
 fn qa_import_alias_member_resolution_uses_original_export_confidence() {
     let (_dir, db) = temp_db_with_dimensions(3);
     let imported_method = db
-        .insert_symbol(&symbol("OriginalService.fetch", "src/service.py"))
+        .insert_symbol(&symbol("OriginalService.fetch", "src/service.ts"))
         .unwrap();
-    let caller = db.insert_symbol(&symbol("caller", "src/app.py")).unwrap();
+    let caller = db.insert_symbol(&symbol("caller", "src/app.ts")).unwrap();
 
     db.insert_edge(&edge(
         caller,
         "AliasService",
-        Some("src/service.py"),
+        Some("src/service.ts"),
         "imports",
         Some("OriginalService"),
     ))
@@ -84,9 +84,9 @@ fn qa_import_alias_member_resolution_uses_original_export_confidence() {
 fn qa_uppercase_qualified_class_method_resolution_keeps_exact_confidence() {
     let (_dir, db) = temp_db_with_dimensions(3);
     let method = db
-        .insert_symbol(&symbol("Parser.parse", "src/parser.py"))
+        .insert_symbol(&symbol("Parser.parse", "src/parser.ts"))
         .unwrap();
-    let caller = db.insert_symbol(&symbol("caller", "src/app.py")).unwrap();
+    let caller = db.insert_symbol(&symbol("caller", "src/app.ts")).unwrap();
     db.insert_edge(&edge(caller, "Parser.parse", None, "calls", None))
         .unwrap();
 
@@ -118,7 +118,11 @@ impl Embedder for FailingEmbedder {
 #[test]
 fn qa_embedder_failure_does_not_mark_file_indexed_without_vectors() {
     let dir = tempdir().unwrap();
-    fs::write(dir.path().join("app.py"), "def alpha():\n    return 1\n").unwrap();
+    fs::write(
+        dir.path().join("app.ts"),
+        "function alpha() {\n  return 1;\n}\n",
+    )
+    .unwrap();
     let mut config = LoomConfig::default_for_target(dir.path());
     config.embedding_dimensions = 3;
     config.enable_git_analysis = false;
@@ -133,5 +137,5 @@ fn qa_embedder_failure_does_not_mark_file_indexed_without_vectors() {
     let stats = db.get_stats().unwrap();
     assert_eq!(stats.symbols, 0);
     assert_eq!(stats.vectors, 0);
-    assert!(db.get_file_hash("app.py").unwrap().is_none());
+    assert!(db.get_file_hash("app.ts").unwrap().is_none());
 }

@@ -3,12 +3,19 @@ pub mod vector;
 
 use crate::config::{LoomConfig, VectorBackendConfig};
 use crate::error::{LoomError, Result};
-use crate::models::{Edge, StoreStats, Symbol};
+use crate::models::{
+    AliasRecord, BehaviorFact, BehaviorFactHit, Callsite, Edge, FileRoleCard, FtsSearchResult,
+    LexicalEvidence, StoreStats, Symbol,
+};
 use migrations::run_migrations;
 use parking_lot::Mutex;
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::debug;
@@ -17,6 +24,9 @@ use vector::{
 };
 
 const FTS5_SPECIAL: [&str; 4] = ["AND", "OR", "NOT", "NEAR"];
+const FTS_MATCH_START: &str = "[[";
+const FTS_MATCH_END: &str = "]]";
+const MAX_FTS_SNIPPET_CHARS: usize = 240;
 const MAX_SQL_LIMIT: usize = 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +49,18 @@ pub struct CochangeRow {
     pub file_b: String,
     pub frequency: i64,
     pub recency: f64,
+}
+
+pub struct FileIndexReplacement<'a> {
+    pub path: &'a str,
+    pub content_hash: &'a str,
+    pub symbols: &'a [Symbol],
+    pub embeddings: &'a [Vec<f32>],
+    pub embedding_fingerprint: &'a str,
+    pub behavior_facts: &'a [BehaviorFact],
+    pub callsites: &'a [Callsite],
+    pub aliases: &'a [AliasRecord],
+    pub role_card: &'a FileRoleCard,
 }
 
 impl ReaderPragma {
@@ -253,16 +275,24 @@ impl LoomDb {
 
     pub fn replace_file_index<F>(
         &self,
-        path: &str,
-        content_hash: &str,
-        symbols: &[Symbol],
-        embeddings: &[Vec<f32>],
-        embedding_fingerprint: &str,
+        replacement: FileIndexReplacement<'_>,
         build_edges: F,
     ) -> Result<(usize, usize)>
     where
         F: FnOnce(&[i64]) -> Result<Vec<Edge>>,
     {
+        let FileIndexReplacement {
+            path,
+            content_hash,
+            symbols,
+            embeddings,
+            embedding_fingerprint,
+            behavior_facts,
+            callsites,
+            aliases,
+            role_card,
+        } = replacement;
+
         if embeddings.len() != symbols.len() {
             return Err(LoomError::EmbedderModel(format!(
                 "embedder returned {} vectors for {} symbols",
@@ -327,6 +357,11 @@ impl LoomDb {
             }
         }
 
+        insert_behavior_facts_in_transaction(&tx, behavior_facts)?;
+        insert_callsites_in_transaction(&tx, callsites)?;
+        insert_aliases_in_transaction(&tx, aliases)?;
+        upsert_role_card_in_transaction(&tx, role_card)?;
+
         for (symbol_id, embedding) in symbol_ids.iter().zip(embeddings.iter()) {
             self.vector_store.insert_embedding(
                 &tx,
@@ -345,22 +380,142 @@ impl LoomDb {
         Ok((symbols.len(), edges.len()))
     }
 
-    pub fn search_fts(&self, query: &str, limit: usize) -> Result<Vec<Symbol>> {
+    pub fn search_fts_with_evidence(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<FtsSearchResult>> {
         let sanitized = sanitize_fts_query(query);
         if sanitized.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
         let limit = checked_sql_limit(limit)?;
+        let match_kind = classify_fts_match(query);
         let conn = self.reader()?;
         let mut stmt = conn.prepare(
-            "SELECT s.id, s.name, s.kind, s.file, s.line, s.end_line, s.language, s.context
-             FROM symbols_fts fts
-             JOIN symbols s ON s.id = fts.rowid
+            "SELECT s.id, s.name, s.kind, s.file, s.line, s.end_line, s.language, s.context,
+                    bm25(symbols_fts) AS lexical_rank,
+                    snippet(symbols_fts, 0, '[[', ']]', ' ... ', 16) AS name_snippet,
+                    snippet(symbols_fts, 1, '[[', ']]', ' ... ', 16) AS kind_snippet,
+                    snippet(symbols_fts, 2, '[[', ']]', ' ... ', 16) AS file_snippet,
+                    snippet(symbols_fts, 3, '[[', ']]', ' ... ', 16) AS context_snippet
+             FROM symbols_fts
+             JOIN symbols s ON s.id = symbols_fts.rowid
              WHERE symbols_fts MATCH ?
-             ORDER BY rank LIMIT ?",
+             ORDER BY lexical_rank, s.file, s.line, s.name, s.id LIMIT ?",
         )?;
-        let rows = stmt.query_map(params![sanitized, limit], row_to_symbol)?;
+        let rows = stmt.query_map(params![sanitized, limit], |row| {
+            row_to_fts_result(row, &sanitized, &match_kind)
+        })?;
         collect_rows(rows)
+    }
+
+    pub fn search_fts(&self, query: &str, limit: usize) -> Result<Vec<Symbol>> {
+        Ok(self
+            .search_fts_with_evidence(query, limit)?
+            .into_iter()
+            .map(|result| result.symbol)
+            .collect())
+    }
+
+    pub fn search_behavior_facts(&self, query: &str, limit: usize) -> Result<Vec<BehaviorFactHit>> {
+        let sanitized = sanitize_fts_query(query);
+        if sanitized.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = checked_sql_limit(limit)?;
+        let match_kind = classify_fts_match(query);
+        let conn = self.reader()?;
+        let mut stmt = conn.prepare(
+            "SELECT f.id, f.fact_type, f.value, f.file, f.line, f.end_line,
+                    f.enclosing_symbol_id, f.enclosing_symbol_name, f.occurrence_count,
+                    bm25(behavior_facts_fts) AS lexical_rank,
+                    snippet(behavior_facts_fts, 0, '[[', ']]', ' ... ', 16) AS type_snippet,
+                    snippet(behavior_facts_fts, 1, '[[', ']]', ' ... ', 16) AS value_snippet,
+                    snippet(behavior_facts_fts, 2, '[[', ']]', ' ... ', 16) AS file_snippet
+             FROM behavior_facts_fts
+             JOIN behavior_facts f ON f.id = behavior_facts_fts.rowid
+             WHERE behavior_facts_fts MATCH ?
+             ORDER BY lexical_rank, f.file, f.line, f.fact_type, f.value, f.id LIMIT ?",
+        )?;
+        let rows = stmt.query_map(params![sanitized, limit], |row| {
+            row_to_behavior_fact_hit(row, &sanitized, &match_kind)
+        })?;
+        collect_rows(rows)
+    }
+
+    pub fn get_behavior_facts_for_file(
+        &self,
+        file: &str,
+        limit: usize,
+    ) -> Result<Vec<BehaviorFact>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = checked_sql_limit(limit)?;
+        let conn = self.reader()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, fact_type, value, file, line, end_line,
+                    enclosing_symbol_id, enclosing_symbol_name, occurrence_count
+             FROM behavior_facts WHERE file = ?
+             ORDER BY line, fact_type, value, id LIMIT ?",
+        )?;
+        let rows = stmt.query_map(params![file, limit], row_to_behavior_fact)?;
+        collect_rows(rows)
+    }
+
+    pub fn get_callsites_for_file(&self, file: &str) -> Result<Vec<Callsite>> {
+        let conn = self.reader()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, file, line, end_line, callee, receiver, unresolved_target,
+                    resolved_target_id, argument_summaries, imported_aliases,
+                    enclosing_symbol_id, enclosing_symbol_name, confidence, generic, downweighted
+             FROM callsites WHERE file = ?
+             ORDER BY line, unresolved_target, id",
+        )?;
+        let rows = stmt.query_map([file], row_to_callsite)?;
+        collect_rows(rows)
+    }
+
+    pub fn get_aliases_for_file(&self, file: &str) -> Result<Vec<AliasRecord>> {
+        let conn = self.reader()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, file, line, end_line, local_name, imported_name, source,
+                    alias_kind, enclosing_symbol_id, enclosing_symbol_name
+             FROM aliases WHERE file = ?
+             ORDER BY line, local_name, imported_name, id",
+        )?;
+        let rows = stmt.query_map([file], row_to_alias)?;
+        collect_rows(rows)
+    }
+
+    pub fn get_role_card(&self, file: &str) -> Result<Option<FileRoleCard>> {
+        let conn = self.reader()?;
+        conn.query_row(
+            "SELECT file, content_hash, primary_responsibility, exported_symbols,
+                    imported_dependencies, behavior_facts, centrality, tests_touching,
+                    top_related_files
+             FROM file_role_cards WHERE file = ?",
+            [file],
+            row_to_role_card,
+        )
+        .optional()
+        .map_err(LoomError::from)
+    }
+
+    pub fn get_role_cards_for_files(&self, files: &[String]) -> Result<Vec<FileRoleCard>> {
+        if files.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut cards = Vec::new();
+        for file in files.iter().take(MAX_SQL_LIMIT) {
+            if let Some(card) = self.get_role_card(file)? {
+                cards.push(card);
+            }
+        }
+        cards.sort_by(|left, right| left.file.cmp(&right.file));
+        cards.dedup_by(|left, right| left.file == right.file);
+        Ok(cards)
     }
 
     pub fn search_vectors(&self, embedding: &[f32], limit: usize) -> Result<Vec<(i64, f64)>> {
@@ -470,6 +625,11 @@ impl LoomDb {
     pub fn clear_index(&self) -> Result<()> {
         let mut conn = self.writer.lock();
         let tx = conn.transaction()?;
+        tx.execute("DELETE FROM behavior_facts_fts", [])?;
+        tx.execute("DELETE FROM behavior_facts", [])?;
+        tx.execute("DELETE FROM callsites", [])?;
+        tx.execute("DELETE FROM aliases", [])?;
+        tx.execute("DELETE FROM file_role_cards", [])?;
         tx.execute("DELETE FROM edges", [])?;
         tx.execute("DELETE FROM symbols_fts", [])?;
         tx.execute("DELETE FROM symbols", [])?;
@@ -672,6 +832,107 @@ impl LoomDb {
         Ok(())
     }
 
+    pub fn resolve_signal_enclosures(&self) -> Result<usize> {
+        let conn = self.writer.lock();
+        let mut changed = 0usize;
+        for table in ["behavior_facts", "callsites", "aliases"] {
+            changed += conn.execute(
+                &format!(
+                    "UPDATE {table}
+                     SET enclosing_symbol_id = (
+                        SELECT s.id FROM symbols s
+                        WHERE s.file = {table}.file
+                          AND s.name = {table}.enclosing_symbol_name
+                        ORDER BY s.line, s.id
+                        LIMIT 1
+                     )
+                     WHERE enclosing_symbol_id IS NULL
+                       AND enclosing_symbol_name IS NOT NULL
+                       AND EXISTS (
+                        SELECT 1 FROM symbols s
+                        WHERE s.file = {table}.file
+                          AND s.name = {table}.enclosing_symbol_name
+                     )"
+                ),
+                [],
+            )?;
+        }
+        Ok(changed)
+    }
+
+    pub fn resolve_callsites_from_edges(&self) -> Result<usize> {
+        let conn = self.writer.lock();
+        let changed = conn.execute(
+            "UPDATE callsites
+             SET resolved_target_id = (
+                SELECT e.target_id FROM edges e
+                WHERE e.source_id = callsites.enclosing_symbol_id
+                  AND e.relationship IN ('calls', 'instantiates')
+                  AND e.target_id IS NOT NULL
+                  AND (e.target_name = callsites.unresolved_target
+                       OR e.target_name = callsites.callee
+                       OR e.target_name LIKE '%' || callsites.callee)
+                ORDER BY e.confidence DESC, e.id
+                LIMIT 1
+             )
+             WHERE resolved_target_id IS NULL
+               AND enclosing_symbol_id IS NOT NULL
+               AND EXISTS (
+                SELECT 1 FROM edges e
+                WHERE e.source_id = callsites.enclosing_symbol_id
+                  AND e.relationship IN ('calls', 'instantiates')
+                  AND e.target_id IS NOT NULL
+                  AND (e.target_name = callsites.unresolved_target
+                       OR e.target_name = callsites.callee
+                       OR e.target_name LIKE '%' || callsites.callee)
+             )",
+            [],
+        )?;
+        Ok(changed)
+    }
+
+    pub fn refresh_role_cards(&self) -> Result<()> {
+        let mut conn = self.writer.lock();
+        let tx = conn.transaction()?;
+        let files = {
+            let mut stmt = tx.prepare("SELECT file FROM file_role_cards ORDER BY file")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            collect_rows(rows)?
+        };
+        let total_symbols = tx.query_row("SELECT COUNT(*) FROM symbols", [], |row| {
+            row.get::<_, i64>(0)
+        })?;
+        for file in files {
+            let incoming = tx.query_row(
+                "SELECT COUNT(*)
+                 FROM edges e
+                 JOIN symbols target ON target.id = e.target_id
+                 JOIN symbols source ON source.id = e.source_id
+                 WHERE target.file = ? AND source.file != target.file",
+                [&file],
+                |row| row.get::<_, i64>(0),
+            )?;
+            let denominator = total_symbols.saturating_sub(1).max(1) as f64;
+            let centrality = (incoming as f64 / denominator).clamp(0.0, 1.0);
+            let related = related_files_for_card(&tx, &file)?;
+            let tests = tests_touching_file(&tx, &file)?;
+            tx.execute(
+                "UPDATE file_role_cards
+                 SET centrality = ?, top_related_files = ?, tests_touching = ?,
+                     updated_at = datetime('now')
+                 WHERE file = ?",
+                params![
+                    centrality,
+                    json_string(&related)?,
+                    json_string(&tests)?,
+                    file
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn upsert_cochange(&self, file_a: &str, file_b: &str, frequency: i64) -> Result<()> {
         self.upsert_cochange_with_recency(file_a, file_b, frequency, 0.0)
     }
@@ -779,15 +1040,95 @@ impl LoomDb {
             |row| row.get(0),
         )?;
         let cochange_pairs = count_table(&conn, "cochange")?;
+        let behavior_facts = count_table(&conn, "behavior_facts")?;
+        let callsites = count_table(&conn, "callsites")?;
+        let aliases = count_table(&conn, "aliases")?;
+        let role_cards = count_table(&conn, "file_role_cards")?;
         Ok(StoreStats {
             symbols,
             edges,
             files,
             vectors,
+            behavior_facts,
+            callsites,
+            aliases,
+            role_cards,
             last_indexed,
             stale_files,
             cochange_pairs,
         })
+    }
+
+    pub fn index_revision(&self) -> Result<String> {
+        let conn = self.reader()?;
+        let mut hasher = Sha256::new();
+        hash_query_rows(
+            &conn,
+            "SELECT id, name, kind, file, line, end_line, language, context
+             FROM symbols ORDER BY id",
+            8,
+            &mut hasher,
+        )?;
+        hash_query_rows(
+            &conn,
+            "SELECT source_id, COALESCE(target_id, -1), target_name,
+                    COALESCE(target_file, ''), relationship, confidence,
+                    COALESCE(original_name, '')
+             FROM edges ORDER BY id",
+            7,
+            &mut hasher,
+        )?;
+        hash_query_rows(
+            &conn,
+            "SELECT file_path, content_hash, embedding_fingerprint
+             FROM index_meta ORDER BY file_path",
+            3,
+            &mut hasher,
+        )?;
+        hash_query_rows(
+            &conn,
+            "SELECT fact_type, value, file, line, end_line,
+                    COALESCE(enclosing_symbol_id, -1), COALESCE(enclosing_symbol_name, ''),
+                    occurrence_count
+             FROM behavior_facts ORDER BY file, line, fact_type, value, id",
+            8,
+            &mut hasher,
+        )?;
+        hash_query_rows(
+            &conn,
+            "SELECT file, line, end_line, callee, COALESCE(receiver, ''),
+                    unresolved_target, COALESCE(resolved_target_id, -1),
+                    argument_summaries, imported_aliases,
+                    COALESCE(enclosing_symbol_id, -1), COALESCE(enclosing_symbol_name, ''),
+                    confidence, generic, downweighted
+             FROM callsites ORDER BY file, line, unresolved_target, id",
+            14,
+            &mut hasher,
+        )?;
+        hash_query_rows(
+            &conn,
+            "SELECT file, line, end_line, local_name, imported_name, source,
+                    alias_kind, COALESCE(enclosing_symbol_id, -1),
+                    COALESCE(enclosing_symbol_name, '')
+             FROM aliases ORDER BY file, line, local_name, source, id",
+            9,
+            &mut hasher,
+        )?;
+        hash_query_rows(
+            &conn,
+            "SELECT file, content_hash, primary_responsibility, exported_symbols,
+                    imported_dependencies, behavior_facts, centrality, tests_touching,
+                    top_related_files
+             FROM file_role_cards ORDER BY file",
+            9,
+            &mut hasher,
+        )?;
+        let digest = hasher.finalize();
+        let mut revision = String::from("idx-");
+        for byte in digest.iter().take(12) {
+            write!(&mut revision, "{byte:02x}").expect("writing to a String should not fail");
+        }
+        Ok(revision)
     }
 
     pub fn reader_pragma_value(&self, pragma: ReaderPragma) -> Result<String> {
@@ -842,26 +1183,88 @@ impl LoomDb {
 }
 
 pub fn sanitize_fts_query(query: &str) -> String {
-    let stripped = query.trim();
-    if stripped.is_empty() {
-        return String::new();
-    }
-    stripped
-        .split_whitespace()
-        .map(|token| {
-            let upper = token.to_ascii_uppercase();
-            if FTS5_SPECIAL.contains(&upper.as_str())
-                || token
-                    .chars()
-                    .any(|character| ['-', '*', '"', '^', ':', '.'].contains(&character))
-            {
-                format!("\"{}\"", token.replace('"', "\"\""))
-            } else {
-                token.to_string()
-            }
+    tokenize_fts_query(query)
+        .into_iter()
+        .filter(|term| {
+            term.text
+                .chars()
+                .any(|character| character.is_alphanumeric() || character == '_')
         })
+        .map(|term| sanitize_fts_term(&term))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FtsQueryTerm {
+    text: String,
+    quoted: bool,
+}
+
+fn tokenize_fts_query(query: &str) -> Vec<FtsQueryTerm> {
+    let mut terms = Vec::new();
+    let mut current = String::new();
+    let mut in_quote = false;
+    let mut current_quoted = false;
+
+    for character in query.chars() {
+        match character {
+            '"' if in_quote => {
+                push_fts_term(&mut terms, &mut current, true);
+                in_quote = false;
+                current_quoted = false;
+            }
+            '"' if current.trim().is_empty() => {
+                push_fts_term(&mut terms, &mut current, current_quoted);
+                in_quote = true;
+                current_quoted = true;
+            }
+            character if character.is_whitespace() && !in_quote => {
+                push_fts_term(&mut terms, &mut current, current_quoted);
+                current_quoted = false;
+            }
+            _ => current.push(character),
+        }
+    }
+    push_fts_term(&mut terms, &mut current, current_quoted);
+    terms
+}
+
+fn push_fts_term(terms: &mut Vec<FtsQueryTerm>, current: &mut String, quoted: bool) {
+    let text = current.trim();
+    if !text.is_empty() {
+        terms.push(FtsQueryTerm {
+            text: text.to_string(),
+            quoted,
+        });
+    }
+    current.clear();
+}
+
+fn sanitize_fts_term(term: &FtsQueryTerm) -> String {
+    let upper = term.text.to_ascii_uppercase();
+    let needs_quotes = term.quoted
+        || FTS5_SPECIAL.contains(&upper.as_str())
+        || term
+            .text
+            .chars()
+            .any(|character| !character.is_alphanumeric() && character != '_');
+    if needs_quotes {
+        format!("\"{}\"", term.text.replace('"', "\"\""))
+    } else {
+        term.text.clone()
+    }
+}
+
+fn classify_fts_match(query: &str) -> String {
+    if tokenize_fts_query(query)
+        .into_iter()
+        .any(|term| term.quoted && term.text.chars().any(char::is_whitespace))
+    {
+        "exact_phrase".to_string()
+    } else {
+        "token_match".to_string()
+    }
 }
 
 fn apply_pragmas(conn: &Connection) -> Result<()> {
@@ -884,6 +1287,138 @@ fn row_to_symbol(row: &Row<'_>) -> rusqlite::Result<Symbol> {
     })
 }
 
+fn row_to_behavior_fact(row: &Row<'_>) -> rusqlite::Result<BehaviorFact> {
+    Ok(BehaviorFact {
+        id: row.get(0)?,
+        fact_type: row.get(1)?,
+        value: row.get(2)?,
+        file: row.get(3)?,
+        line: row.get(4)?,
+        end_line: row.get(5)?,
+        enclosing_symbol_id: row.get(6)?,
+        enclosing_symbol_name: row.get(7)?,
+        occurrence_count: row.get(8)?,
+    })
+}
+
+fn row_to_behavior_fact_hit(
+    row: &Row<'_>,
+    sanitized_query: &str,
+    match_kind: &str,
+) -> rusqlite::Result<BehaviorFactHit> {
+    let fact = row_to_behavior_fact(row)?;
+    let rank = row.get(9)?;
+    let snippets = [
+        ("fact_type", row.get::<_, String>(10)?),
+        ("value", row.get::<_, String>(11)?),
+        ("file", row.get::<_, String>(12)?),
+    ];
+    let (field, marked_snippet) = snippets
+        .iter()
+        .find(|(_, snippet)| snippet.contains(FTS_MATCH_START))
+        .unwrap_or(&snippets[1]);
+    let matched_text = extract_marked_text(marked_snippet)
+        .unwrap_or_else(|| fallback_matched_text(sanitized_query));
+    Ok(BehaviorFactHit {
+        fact,
+        lexical_evidence: LexicalEvidence {
+            snippet: bounded_text(&strip_match_markers(marked_snippet), MAX_FTS_SNIPPET_CHARS),
+            matched_text: bounded_text(&matched_text, MAX_FTS_SNIPPET_CHARS),
+            rank,
+            field: (*field).to_string(),
+            reason: format!("fact_fts:{field}"),
+            match_kind: match_kind.to_string(),
+            sanitized_query: sanitized_query.to_string(),
+        },
+    })
+}
+
+fn row_to_callsite(row: &Row<'_>) -> rusqlite::Result<Callsite> {
+    let argument_summaries = json_vec(row.get::<_, String>(8)?);
+    let imported_aliases = json_vec(row.get::<_, String>(9)?);
+    Ok(Callsite {
+        id: row.get(0)?,
+        file: row.get(1)?,
+        line: row.get(2)?,
+        end_line: row.get(3)?,
+        callee: row.get(4)?,
+        receiver: row.get(5)?,
+        unresolved_target: row.get(6)?,
+        resolved_target_id: row.get(7)?,
+        argument_summaries,
+        imported_aliases,
+        enclosing_symbol_id: row.get(10)?,
+        enclosing_symbol_name: row.get(11)?,
+        confidence: row.get(12)?,
+        generic: row.get::<_, i64>(13)? != 0,
+        downweighted: row.get::<_, i64>(14)? != 0,
+    })
+}
+
+fn row_to_alias(row: &Row<'_>) -> rusqlite::Result<AliasRecord> {
+    Ok(AliasRecord {
+        id: row.get(0)?,
+        file: row.get(1)?,
+        line: row.get(2)?,
+        end_line: row.get(3)?,
+        local_name: row.get(4)?,
+        imported_name: row.get(5)?,
+        source: row.get(6)?,
+        alias_kind: row.get(7)?,
+        enclosing_symbol_id: row.get(8)?,
+        enclosing_symbol_name: row.get(9)?,
+    })
+}
+
+fn row_to_role_card(row: &Row<'_>) -> rusqlite::Result<FileRoleCard> {
+    Ok(FileRoleCard {
+        file: row.get(0)?,
+        content_hash: row.get(1)?,
+        primary_responsibility: row.get(2)?,
+        exported_symbols: json_vec(row.get::<_, String>(3)?),
+        imported_dependencies: json_vec(row.get::<_, String>(4)?),
+        behavior_facts: json_vec(row.get::<_, String>(5)?),
+        centrality: row.get(6)?,
+        tests_touching: json_vec(row.get::<_, String>(7)?),
+        top_related_files: json_vec(row.get::<_, String>(8)?),
+    })
+}
+
+fn row_to_fts_result(
+    row: &Row<'_>,
+    sanitized_query: &str,
+    match_kind: &str,
+) -> rusqlite::Result<FtsSearchResult> {
+    let symbol = row_to_symbol(row)?;
+    let rank = row.get(8)?;
+    let snippets = [
+        ("name", row.get::<_, String>(9)?),
+        ("kind", row.get::<_, String>(10)?),
+        ("file", row.get::<_, String>(11)?),
+        ("context", row.get::<_, String>(12)?),
+    ];
+    let (field, marked_snippet) = snippets
+        .iter()
+        .find(|(_, snippet)| snippet.contains(FTS_MATCH_START))
+        .unwrap_or(&snippets[3]);
+    let matched_text = extract_marked_text(marked_snippet)
+        .unwrap_or_else(|| fallback_matched_text(sanitized_query));
+    let snippet = bounded_text(&strip_match_markers(marked_snippet), MAX_FTS_SNIPPET_CHARS);
+
+    Ok(FtsSearchResult {
+        symbol,
+        evidence: LexicalEvidence {
+            snippet,
+            matched_text: bounded_text(&matched_text, MAX_FTS_SNIPPET_CHARS),
+            rank,
+            field: (*field).to_string(),
+            reason: format!("fts:{field}"),
+            match_kind: match_kind.to_string(),
+            sanitized_query: sanitized_query.to_string(),
+        },
+    })
+}
+
 fn row_to_edge(row: &Row<'_>) -> rusqlite::Result<Edge> {
     Ok(Edge {
         id: row.get(0)?,
@@ -897,6 +1432,171 @@ fn row_to_edge(row: &Row<'_>) -> rusqlite::Result<Edge> {
     })
 }
 
+fn insert_behavior_facts_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    facts: &[BehaviorFact],
+) -> Result<()> {
+    let mut fact_stmt = tx.prepare(
+        "INSERT INTO behavior_facts
+         (fact_type, value, file, line, end_line, enclosing_symbol_id,
+          enclosing_symbol_name, occurrence_count)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    )?;
+    let mut fts_stmt = tx.prepare(
+        "INSERT INTO behavior_facts_fts (rowid, fact_type, value, file)
+         VALUES (?, ?, ?, ?)",
+    )?;
+    for fact in facts {
+        fact_stmt.execute(params![
+            fact.fact_type,
+            fact.value,
+            fact.file,
+            fact.line,
+            fact.end_line,
+            fact.enclosing_symbol_id,
+            fact.enclosing_symbol_name,
+            fact.occurrence_count
+        ])?;
+        let fact_id = tx.last_insert_rowid();
+        fts_stmt.execute(params![fact_id, fact.fact_type, fact.value, fact.file])?;
+    }
+    Ok(())
+}
+
+fn insert_callsites_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    callsites: &[Callsite],
+) -> Result<()> {
+    let mut stmt = tx.prepare(
+        "INSERT INTO callsites
+         (file, line, end_line, callee, receiver, unresolved_target, resolved_target_id,
+          argument_summaries, imported_aliases, enclosing_symbol_id, enclosing_symbol_name,
+          confidence, generic, downweighted)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )?;
+    for callsite in callsites {
+        stmt.execute(params![
+            callsite.file,
+            callsite.line,
+            callsite.end_line,
+            callsite.callee,
+            callsite.receiver,
+            callsite.unresolved_target,
+            callsite.resolved_target_id,
+            json_string(&callsite.argument_summaries)?,
+            json_string(&callsite.imported_aliases)?,
+            callsite.enclosing_symbol_id,
+            callsite.enclosing_symbol_name,
+            callsite.confidence,
+            bool_int(callsite.generic),
+            bool_int(callsite.downweighted)
+        ])?;
+    }
+    Ok(())
+}
+
+fn insert_aliases_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    aliases: &[AliasRecord],
+) -> Result<()> {
+    let mut stmt = tx.prepare(
+        "INSERT INTO aliases
+         (file, line, end_line, local_name, imported_name, source, alias_kind,
+          enclosing_symbol_id, enclosing_symbol_name)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )?;
+    for alias in aliases {
+        stmt.execute(params![
+            alias.file,
+            alias.line,
+            alias.end_line,
+            alias.local_name,
+            alias.imported_name,
+            alias.source,
+            alias.alias_kind,
+            alias.enclosing_symbol_id,
+            alias.enclosing_symbol_name
+        ])?;
+    }
+    Ok(())
+}
+
+fn upsert_role_card_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    role_card: &FileRoleCard,
+) -> Result<()> {
+    tx.execute(
+        "INSERT OR REPLACE INTO file_role_cards
+         (file, content_hash, primary_responsibility, exported_symbols,
+          imported_dependencies, behavior_facts, centrality, tests_touching,
+          top_related_files, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
+        params![
+            role_card.file,
+            role_card.content_hash,
+            role_card.primary_responsibility,
+            json_string(&role_card.exported_symbols)?,
+            json_string(&role_card.imported_dependencies)?,
+            json_string(&role_card.behavior_facts)?,
+            role_card.centrality,
+            json_string(&role_card.tests_touching)?,
+            json_string(&role_card.top_related_files)?
+        ],
+    )?;
+    Ok(())
+}
+
+fn bool_int(value: bool) -> i64 {
+    if value {
+        1
+    } else {
+        0
+    }
+}
+
+fn json_string<T: Serialize>(value: &T) -> Result<String> {
+    serde_json::to_string(value).map_err(|source| {
+        LoomError::InvalidInput(format!("failed to encode indexed signal JSON: {source}"))
+    })
+}
+
+fn json_vec(value: String) -> Vec<String> {
+    serde_json::from_str(&value).unwrap_or_default()
+}
+
+fn extract_marked_text(snippet: &str) -> Option<String> {
+    let start = snippet.find(FTS_MATCH_START)? + FTS_MATCH_START.len();
+    let rest = &snippet[start..];
+    let end = rest.find(FTS_MATCH_END)?;
+    Some(rest[..end].to_string())
+}
+
+fn fallback_matched_text(sanitized_query: &str) -> String {
+    sanitized_query
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim_matches('"')
+        .replace("\"\"", "\"")
+}
+
+fn strip_match_markers(snippet: &str) -> String {
+    snippet
+        .replace(FTS_MATCH_START, "")
+        .replace(FTS_MATCH_END, "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn bounded_text(value: &str, max_chars: usize) -> String {
+    let mut output = value.chars().take(max_chars).collect::<String>();
+    if value.chars().count() > max_chars {
+        output.push_str("...");
+    }
+    output
+}
+
 fn collect_rows<T, F>(rows: rusqlite::MappedRows<'_, F>) -> Result<Vec<T>>
 where
     F: FnMut(&Row<'_>) -> rusqlite::Result<T>,
@@ -908,9 +1608,107 @@ where
     Ok(values)
 }
 
+fn hash_query_rows(
+    conn: &Connection,
+    sql: &str,
+    column_count: usize,
+    hasher: &mut Sha256,
+) -> Result<()> {
+    let mut stmt = conn.prepare(sql)?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        for index in 0..column_count {
+            let value: rusqlite::types::Value = row.get(index)?;
+            hasher.update(format!("{value:?}").as_bytes());
+            hasher.update([0]);
+        }
+        hasher.update(b"\n");
+    }
+    Ok(())
+}
+
 fn select_symbol_ids_for_file(conn: &Connection, path: &str) -> Result<Vec<i64>> {
     let mut stmt = conn.prepare("SELECT id FROM symbols WHERE file = ?")?;
     let rows = stmt.query_map([path], |row| row.get(0))?;
+    collect_rows(rows)
+}
+
+fn select_behavior_fact_ids_for_file(conn: &Connection, path: &str) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare("SELECT id FROM behavior_facts WHERE file = ?")?;
+    let rows = stmt.query_map([path], |row| row.get(0))?;
+    collect_rows(rows)
+}
+
+fn related_files_for_card(conn: &Connection, file: &str) -> Result<Vec<String>> {
+    let mut scores = BTreeMap::<String, i64>::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT other_file, SUM(weight) AS score FROM (
+                SELECT target.file AS other_file, 2 AS weight
+                FROM edges e
+                JOIN symbols source ON source.id = e.source_id
+                JOIN symbols target ON target.id = e.target_id
+                WHERE source.file = ? AND target.file != source.file
+                UNION ALL
+                SELECT source.file AS other_file, 1 AS weight
+                FROM edges e
+                JOIN symbols source ON source.id = e.source_id
+                JOIN symbols target ON target.id = e.target_id
+                WHERE target.file = ? AND source.file != target.file
+            )
+             GROUP BY other_file ORDER BY score DESC, other_file LIMIT 8",
+        )?;
+        let rows = stmt.query_map(params![file, file], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (other, score) = row?;
+            scores.insert(other, score);
+        }
+    }
+    for (other, frequency) in top_cochanges_with_conn(conn, file, 8)? {
+        *scores.entry(other).or_insert(0) += frequency;
+    }
+    let mut related = scores.into_iter().collect::<Vec<_>>();
+    related.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    related.truncate(5);
+    Ok(related.into_iter().map(|(file, _)| file).collect())
+}
+
+fn tests_touching_file(conn: &Connection, file: &str) -> Result<Vec<String>> {
+    let stem = std::path::Path::new(file)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default();
+    if stem.is_empty() {
+        return Ok(Vec::new());
+    }
+    let pattern = format!("%{stem}%");
+    let mut stmt = conn.prepare(
+        "SELECT file_path FROM index_meta
+         WHERE file_path != ?
+           AND (file_path LIKE '%test%' OR file_path LIKE '%spec%')
+           AND file_path LIKE ?
+         ORDER BY file_path LIMIT 8",
+    )?;
+    let rows = stmt.query_map(params![file, pattern], |row| row.get(0))?;
+    collect_rows(rows)
+}
+
+fn top_cochanges_with_conn(
+    conn: &Connection,
+    file: &str,
+    limit: usize,
+) -> Result<Vec<(String, i64)>> {
+    let limit = checked_sql_limit(limit)?;
+    let mut stmt = conn.prepare(
+        "SELECT CASE WHEN file_a = ? THEN file_b ELSE file_a END AS other_file, frequency
+         FROM cochange WHERE file_a = ? OR file_b = ?
+         ORDER BY frequency DESC, recency DESC LIMIT ?",
+    )?;
+    let rows = stmt.query_map(params![file, file, file, limit], |row| {
+        Ok((row.get(0)?, row.get(1)?))
+    })?;
     collect_rows(rows)
 }
 
@@ -931,6 +1729,16 @@ fn remove_file_in_transaction(
         let sql = format!("DELETE FROM symbols_fts WHERE rowid IN ({placeholders})");
         conn.execute(&sql, params_from_iter(symbol_ids.iter()))?;
     }
+    let fact_ids = select_behavior_fact_ids_for_file(conn, path)?;
+    if !fact_ids.is_empty() {
+        let placeholders = repeat_placeholders(fact_ids.len());
+        let sql = format!("DELETE FROM behavior_facts_fts WHERE rowid IN ({placeholders})");
+        conn.execute(&sql, params_from_iter(fact_ids.iter()))?;
+    }
+    conn.execute("DELETE FROM behavior_facts WHERE file = ?", [path])?;
+    conn.execute("DELETE FROM callsites WHERE file = ?", [path])?;
+    conn.execute("DELETE FROM aliases WHERE file = ?", [path])?;
+    conn.execute("DELETE FROM file_role_cards WHERE file = ?", [path])?;
     conn.execute("DELETE FROM symbols WHERE file = ?", [path])?;
     conn.execute("DELETE FROM index_meta WHERE file_path = ?", [path])?;
     conn.execute(

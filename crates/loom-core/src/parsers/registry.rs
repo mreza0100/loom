@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
     csharp::CSharpAdapter, go::GoAdapter, java::JavaAdapter, javascript::JavaScriptAdapter,
-    python::PythonAdapter, rust::RustAdapter, LanguageAdapter,
+    rust::RustAdapter, LanguageAdapter,
 };
 
 pub struct AdapterRegistry {
@@ -18,7 +18,6 @@ impl AdapterRegistry {
             by_extension: BTreeMap::new(),
         };
         registry.register(Box::new(JavaScriptAdapter));
-        registry.register(Box::new(PythonAdapter));
         registry.register(Box::new(GoAdapter));
         registry.register(Box::new(JavaAdapter));
         registry.register(Box::new(RustAdapter));

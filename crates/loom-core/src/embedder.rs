@@ -1,10 +1,11 @@
 use crate::{
     config::{EmbeddingBackendConfig, LoomConfig},
     error::{LoomError, Result},
+    jina_bert::{JinaBertModel, DTYPE},
 };
 use candle_core::{Device, Tensor};
-use candle_nn::{Module, VarBuilder};
-use candle_transformers::models::jina_bert::{BertModel, Config, DTYPE};
+use candle_nn::VarBuilder;
+use candle_transformers::models::jina_bert::Config;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -222,7 +223,7 @@ pub struct CandleEmbedder<S: ModelSource = HfHubModelSource> {
     model_repo: String,
     tokenizer: Tokenizer,
     device: Device,
-    model: BertModel,
+    model: JinaBertModel,
     pad_token_id: u32,
     _model_files: ModelFiles,
     _source: Arc<S>,
@@ -333,9 +334,10 @@ impl<S: ModelSource> Embedder for CandleEmbedder<S> {
         }
         let input_ids = Tensor::new(ids, &self.device)
             .map_err(|source| LoomError::EmbedderModel(source.to_string()))?;
+        let attention_mask = build_attention_mask(&masks, &self.device)?;
         let sequence = self
             .model
-            .forward(&input_ids)
+            .forward(&input_ids, Some(&attention_mask))
             .map_err(|source| LoomError::EmbedderModel(source.to_string()))?;
         let values = sequence
             .to_vec3::<f32>()
@@ -357,13 +359,27 @@ pub fn build_symbol_text(name: &str, kind: &str, context: &str) -> String {
     format!("{kind} {name}\n{context}")
 }
 
-fn load_jina_model(weights: &Path, device: &Device, config: &Config) -> Result<BertModel> {
+fn load_jina_model(weights: &Path, device: &Device, config: &Config) -> Result<JinaBertModel> {
     let paths = [weights];
     // SAFETY: Candle maps immutable safetensors files and owns the mmap backend for the
     // VarBuilder lifetime. Loom only passes local cache paths returned by ModelSource.
     let var_builder = unsafe { VarBuilder::from_mmaped_safetensors(&paths, DTYPE, device) }
         .map_err(|source| LoomError::EmbedderModel(source.to_string()))?;
-    BertModel::new(var_builder, config)
+    JinaBertModel::new(var_builder, config)
+        .map_err(|source| LoomError::EmbedderModel(source.to_string()))
+}
+
+fn build_attention_mask(masks: &[Vec<f32>], device: &Device) -> Result<Tensor> {
+    let attention_bias = masks
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|token| if *token > 0.0 { 0.0 } else { -10_000.0 })
+                .collect::<Vec<f32>>()
+        })
+        .collect::<Vec<_>>();
+    Tensor::new(attention_bias, device)
+        .and_then(|tensor| tensor.unsqueeze(1)?.unsqueeze(1))
         .map_err(|source| LoomError::EmbedderModel(source.to_string()))
 }
 

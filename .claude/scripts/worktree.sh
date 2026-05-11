@@ -28,11 +28,6 @@ cmd_create() {
 
   git worktree add "$worktree_dir" "$branch"
 
-  # Install Python dependencies in worktree
-  if [ -f "${worktree_dir}/pyproject.toml" ]; then
-    (cd "${worktree_dir}" && uv sync 2>/dev/null) || true
-  fi
-
   # Allocate unique ports
   local ports
   ports=$("$ALLOC" alloc "$pipeline")

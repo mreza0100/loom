@@ -18,10 +18,10 @@ impl ModelSource for LocalModelSource {
 }
 
 #[test]
-fn symbol_text_matches_python_contract() {
+fn symbol_text_matches_rust_contract() {
     assert_eq!(
-        build_symbol_text("alpha", "function", "def alpha(): pass"),
-        "function alpha\ndef alpha(): pass"
+        build_symbol_text("alpha", "function", "function alpha() {}"),
+        "function alpha\nfunction alpha() {}"
     );
 }
 
@@ -83,6 +83,7 @@ fn default_embedder_hashing_mode_skips_candle_loader() {
     assert_eq!(status.backend, "hashing");
     assert!(!status.degraded);
     assert_eq!(status.dimensions, 8);
+    assert_eq!(status.model, None);
 }
 
 #[test]
@@ -111,9 +112,57 @@ fn default_embedder_explicit_fallback_reports_degraded_hashing() {
     assert_eq!(status.backend, "hashing");
     assert!(status.degraded);
     assert_eq!(status.dimensions, 8);
+    assert_eq!(status.model, None);
     assert_eq!(
         embedder.fingerprint(),
         "embedder=hashing;degraded=true;model=none;dims=8"
     );
     assert_ne!(embedder.fingerprint(), config.embedding_fingerprint());
+}
+
+#[test]
+fn live_jina_candle_smoke_when_enabled() {
+    if !matches!(std::env::var("LOOM_LIVE_JINA_SMOKE").as_deref(), Ok("1")) {
+        eprintln!("skipping live Jina smoke; set LOOM_LIVE_JINA_SMOKE=1 to run");
+        return;
+    }
+
+    let config = LoomConfig::default_for_target(".");
+    let embedder = DefaultEmbedder::from_config(&config).unwrap();
+    let status = embedder.status();
+
+    assert_eq!(status.backend, "candle");
+    assert!(!status.degraded);
+    assert_eq!(status.dimensions, 768);
+    assert_eq!(
+        status.model.as_deref(),
+        Some("jinaai/jina-embeddings-v2-base-code")
+    );
+
+    let texts = vec![
+        "function parseConfig(input) { return JSON.parse(input); }".to_string(),
+        "function parseConfig(input) { return JSON.parse(input); }".to_string(),
+        "button.primary { color: rebeccapurple; }".to_string(),
+    ];
+    let embeddings = embedder.embed(&texts).unwrap();
+
+    assert_eq!(embeddings.len(), 3);
+    for embedding in &embeddings {
+        assert_eq!(embedding.len(), 768);
+        assert!(embedding.iter().all(|value| value.is_finite()));
+        let norm = embedding
+            .iter()
+            .map(|value| value * value)
+            .sum::<f32>()
+            .sqrt();
+        assert!((norm - 1.0).abs() < 0.000_1);
+    }
+    assert!(dot(&embeddings[0], &embeddings[1]) > dot(&embeddings[0], &embeddings[2]));
+}
+
+fn dot(left: &[f32], right: &[f32]) -> f32 {
+    left.iter()
+        .zip(right.iter())
+        .map(|(left, right)| left * right)
+        .sum()
 }

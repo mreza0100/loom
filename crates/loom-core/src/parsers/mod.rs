@@ -3,15 +3,15 @@ pub mod go;
 pub mod java;
 pub mod javascript;
 pub mod parser;
-pub mod python;
 pub mod registry;
 pub mod rust;
+pub mod signals;
 pub mod tree_sitter_utils;
 
 use std::collections::BTreeSet;
 
 use crate::{
-    models::{ParsedEdge, Symbol},
+    models::{ParsedAlias, ParsedBehaviorFact, ParsedCallsite, ParsedEdge, Symbol},
     Result,
 };
 
@@ -22,6 +22,9 @@ pub use registry::AdapterRegistry;
 pub struct ParseResult {
     pub symbols: Vec<Symbol>,
     pub edges: Vec<ParsedEdge>,
+    pub behavior_facts: Vec<ParsedBehaviorFact>,
+    pub callsites: Vec<ParsedCallsite>,
+    pub aliases: Vec<ParsedAlias>,
 }
 
 pub trait LanguageAdapter: Send + Sync {

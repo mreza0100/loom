@@ -2,7 +2,7 @@ use std::path::Path;
 
 use crate::{
     error::{LoomError, Result},
-    parsers::{AdapterRegistry, ParseResult},
+    parsers::{signals::augment_parse_result, AdapterRegistry, ParseResult},
 };
 
 pub fn parse_file(
@@ -18,18 +18,24 @@ pub fn parse_file(
     let Some(extension) = extension else {
         return Ok(ParseResult::default());
     };
-    let Some(adapter) = registry.get_adapter(&extension) else {
-        return Ok(ParseResult::default());
-    };
-
-    match source {
-        Some(bytes) => adapter.parse(bytes, &path.to_string_lossy()),
+    let path_string = path.to_string_lossy();
+    let bytes;
+    let source = match source {
+        Some(bytes) => bytes,
         None => {
-            let bytes = std::fs::read(path).map_err(|source| LoomError::ParserIo {
-                path: path.to_string_lossy().into_owned(),
+            bytes = std::fs::read(path).map_err(|source| LoomError::ParserIo {
+                path: path_string.clone().into_owned(),
                 source,
             })?;
-            adapter.parse(&bytes, &path.to_string_lossy())
+            &bytes
         }
-    }
+    };
+
+    let mut result = if let Some(adapter) = registry.get_adapter(&extension) {
+        adapter.parse(source, &path_string)?
+    } else {
+        ParseResult::default()
+    };
+    augment_parse_result(&mut result, source, &path_string);
+    Ok(result)
 }

@@ -1,17 +1,17 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.egg-info/
-dist/
-build/
-.venv/
-.eggs/
+# Rust
+target/
 
 # Loom
 .loom/
 
-# Environment
+# Generated output
+tmp/
+sample/
+*.log
+dist/
+build/
+
+# Environment and secrets
 .env
 .env.*
 .env.local
@@ -32,25 +32,8 @@ secrets.*
 .DS_Store
 Thumbs.db
 
-# Dev
-tmp/
-sample/
-*.log
-
-# Tool caches
-.mypy_cache/
-.pytest_cache/
-.ruff_cache/
-.coverage
-
-# MCP config (contains absolute paths — see README for setup)
+# Local MCP config contains absolute paths.
 .mcp.json
 
-# Worktrees (legacy)
+# Worktrees
 .worktrees/
-
-# uv
-.python-version
-
-# Rust
-target/

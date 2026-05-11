@@ -13,21 +13,21 @@ fn git_parser_filters_and_scores_pairs() {
     let config = LoomConfig::default_for_target(dir.path());
     let output = "\
 ---COMMIT---
-src/a.py
-src/b.py
+src/a.ts
+src/b.ts
 README.md
 ---COMMIT---
-src/a.py
-src/b.py
+src/a.ts
+src/b.ts
 src/c.ts
 ---COMMIT---
-src/a.py
+src/a.ts
 ";
 
     let pairs = parse_git_log(output, dir.path(), &config.watch_extensions, 10);
     let ab = pairs
         .iter()
-        .find(|pair| pair.file_a == "src/a.py" && pair.file_b == "src/b.py")
+        .find(|pair| pair.file_a == "src/a.ts" && pair.file_b == "src/b.ts")
         .unwrap();
     assert_eq!(ab.frequency, 2);
     assert!(ab.recency > 0.0);

@@ -4,6 +4,7 @@ pub mod error;
 pub mod git_analyzer;
 pub mod graph;
 pub mod indexer;
+mod jina_bert;
 pub mod models;
 pub mod parsers;
 pub mod search;

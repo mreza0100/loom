@@ -31,8 +31,8 @@ impl Embedder for MockEmbedder {
 #[test]
 fn full_index_indexes_changed_files_and_skips_unchanged_files() {
     let dir = tempdir().unwrap();
-    let file = dir.path().join("app.py");
-    fs::write(&file, "def alpha():\n    return 1\n").unwrap();
+    let file = dir.path().join("app.ts");
+    fs::write(&file, "function alpha() {\n  return 1;\n}\n").unwrap();
     let mut config = LoomConfig::default_for_target(dir.path());
     config.embedding_dimensions = 3;
     config.enable_git_analysis = false;
@@ -57,8 +57,8 @@ fn full_index_indexes_changed_files_and_skips_unchanged_files() {
 #[test]
 fn full_index_removes_stale_deleted_files() {
     let dir = tempdir().unwrap();
-    let file = dir.path().join("app.py");
-    fs::write(&file, "def alpha():\n    return 1\n").unwrap();
+    let file = dir.path().join("app.ts");
+    fs::write(&file, "function alpha() {\n  return 1;\n}\n").unwrap();
     let mut config = LoomConfig::default_for_target(dir.path());
     config.embedding_dimensions = 3;
     config.enable_git_analysis = false;
@@ -74,7 +74,7 @@ fn full_index_removes_stale_deleted_files() {
     let result = pipeline.full_index().unwrap();
     assert_eq!(result.deleted, 1);
     assert_eq!(db.get_stats().unwrap().symbols, 0);
-    assert!(db.get_file_hash("app.py").unwrap().is_none());
+    assert!(db.get_file_hash("app.ts").unwrap().is_none());
 }
 
 #[test]
@@ -82,8 +82,8 @@ fn full_index_handles_more_files_than_old_parser_channel_bound() {
     let dir = tempdir().unwrap();
     for index in 0..80 {
         fs::write(
-            dir.path().join(format!("module_{index}.py")),
-            format!("def symbol_{index}():\n    return {index}\n"),
+            dir.path().join(format!("module_{index}.ts")),
+            format!("function symbol_{index}() {{\n  return {index};\n}}\n"),
         )
         .unwrap();
     }
@@ -101,8 +101,8 @@ fn full_index_handles_more_files_than_old_parser_channel_bound() {
 #[test]
 fn full_index_rebuilds_vectors_when_backend_changes() {
     let dir = tempdir().unwrap();
-    let file = dir.path().join("app.py");
-    fs::write(&file, "def alpha():\n    return 1\n").unwrap();
+    let file = dir.path().join("app.ts");
+    fs::write(&file, "function alpha() {\n  return 1;\n}\n").unwrap();
     let mut blob_config = LoomConfig::default_for_target(dir.path());
     blob_config.embedding_dimensions = 3;
     blob_config.enable_git_analysis = false;
@@ -134,15 +134,15 @@ fn full_index_rebuilds_vectors_when_backend_changes() {
     assert_eq!(rebuilt.skipped, 0);
     assert_eq!(sqlite_db.get_stats().unwrap().vectors, 1);
     assert!(sqlite_db
-        .file_index_is_fresh("app.py", &walk_hash(&file), &mock_fingerprint(3))
+        .file_index_is_fresh("app.ts", &walk_hash(&file), &mock_fingerprint(3))
         .unwrap());
 }
 
 #[test]
 fn full_index_rebuilds_vectors_when_embedding_fingerprint_changes() {
     let dir = tempdir().unwrap();
-    let file = dir.path().join("app.py");
-    fs::write(&file, "def alpha():\n    return 1\n").unwrap();
+    let file = dir.path().join("app.ts");
+    fs::write(&file, "function alpha() {\n  return 1;\n}\n").unwrap();
     let mut first_config = LoomConfig::default_for_target(dir.path());
     first_config.embedding_dimensions = 3;
     first_config.enable_git_analysis = false;
@@ -155,7 +155,7 @@ fn full_index_rebuilds_vectors_when_embedding_fingerprint_changes() {
     );
     assert_eq!(first_pipeline.full_index().unwrap().indexed, 1);
     assert!(db
-        .file_index_is_fresh("app.py", &walk_hash(&file), &mock_fingerprint(3))
+        .file_index_is_fresh("app.ts", &walk_hash(&file), &mock_fingerprint(3))
         .unwrap());
 
     let mut second_config = LoomConfig::default_for_target(dir.path());
@@ -164,7 +164,7 @@ fn full_index_rebuilds_vectors_when_embedding_fingerprint_changes() {
     second_config.vector_backend = VectorBackendConfig::Blob;
     let reopened = Arc::new(LoomDb::open(second_config.clone()).unwrap());
     assert!(!reopened
-        .file_index_is_fresh("app.py", &walk_hash(&file), &mock_fingerprint(4))
+        .file_index_is_fresh("app.ts", &walk_hash(&file), &mock_fingerprint(4))
         .unwrap());
     let second_pipeline = IndexPipeline::new(
         second_config,
@@ -178,15 +178,15 @@ fn full_index_rebuilds_vectors_when_embedding_fingerprint_changes() {
     assert_eq!(rebuilt.skipped, 0);
     assert_eq!(reopened.get_stats().unwrap().vectors, 1);
     assert!(reopened
-        .file_index_is_fresh("app.py", &walk_hash(&file), &mock_fingerprint(4))
+        .file_index_is_fresh("app.ts", &walk_hash(&file), &mock_fingerprint(4))
         .unwrap());
 }
 
 #[test]
 fn incremental_delete_removes_symbols_vectors_and_hash() {
     let dir = tempdir().unwrap();
-    let file = dir.path().join("app.py");
-    fs::write(&file, "def alpha():\n    return 1\n").unwrap();
+    let file = dir.path().join("app.ts");
+    fs::write(&file, "function alpha() {\n  return 1;\n}\n").unwrap();
     let mut config = LoomConfig::default_for_target(dir.path());
     config.embedding_dimensions = 3;
     config.enable_git_analysis = false;
@@ -204,7 +204,7 @@ fn incremental_delete_removes_symbols_vectors_and_hash() {
     let stats = db.get_stats().unwrap();
     assert_eq!(stats.symbols, 0);
     assert_eq!(stats.vectors, 0);
-    assert!(db.get_file_hash("app.py").unwrap().is_none());
+    assert!(db.get_file_hash("app.ts").unwrap().is_none());
 }
 
 fn walk_hash(path: &std::path::Path) -> String {
@@ -218,9 +218,9 @@ fn mock_fingerprint(dimensions: usize) -> String {
 #[test]
 fn incremental_rename_removes_old_path_and_indexes_new_path() {
     let dir = tempdir().unwrap();
-    let old_file = dir.path().join("old.py");
-    let new_file = dir.path().join("new.py");
-    fs::write(&old_file, "def renamed_symbol():\n    return 1\n").unwrap();
+    let old_file = dir.path().join("old.ts");
+    let new_file = dir.path().join("new.ts");
+    fs::write(&old_file, "function renamed_symbol() {\n  return 1;\n}\n").unwrap();
     let mut config = LoomConfig::default_for_target(dir.path());
     config.embedding_dimensions = 3;
     config.enable_git_analysis = false;
@@ -243,15 +243,15 @@ fn incremental_rename_removes_old_path_and_indexes_new_path() {
     assert_eq!(stats.files, 1);
     assert_eq!(stats.symbols, 1);
     assert_eq!(stats.vectors, 1);
-    assert!(db.get_file_hash("old.py").unwrap().is_none());
-    assert!(db.get_file_hash("new.py").unwrap().is_some());
+    assert!(db.get_file_hash("old.ts").unwrap().is_none());
+    assert!(db.get_file_hash("new.ts").unwrap().is_some());
     let symbols = db
         .get_symbol_by_name("renamed_symbol", None)
         .unwrap()
         .into_iter()
         .map(|symbol| symbol.file)
         .collect::<Vec<_>>();
-    assert_eq!(symbols, vec!["new.py"]);
+    assert_eq!(symbols, vec!["new.ts"]);
 }
 
 #[test]
@@ -260,8 +260,8 @@ fn incremental_index_rejects_relative_path_escape() {
     let target = dir.path().join("target");
     fs::create_dir(&target).unwrap();
     fs::write(
-        dir.path().join("outside.py"),
-        "def outside():\n    return 1\n",
+        dir.path().join("outside.ts"),
+        "function outside() {\n  return 1;\n}\n",
     )
     .unwrap();
     let mut config = LoomConfig::default_for_target(&target);
@@ -271,7 +271,7 @@ fn incremental_index_rejects_relative_path_escape() {
     let pipeline = IndexPipeline::new(config, db, Arc::new(MockEmbedder { dimensions: 3 }));
 
     let error = pipeline
-        .incremental_index([std::path::PathBuf::from("../outside.py")])
+        .incremental_index([std::path::PathBuf::from("../outside.ts")])
         .unwrap_err();
     assert!(matches!(error, LoomError::IndexerPath(_)));
 }
@@ -292,7 +292,11 @@ impl Embedder for BadEmbedder {
 #[test]
 fn embedder_failure_is_batch_fatal() {
     let dir = tempdir().unwrap();
-    fs::write(dir.path().join("app.py"), "def alpha():\n    return 1\n").unwrap();
+    fs::write(
+        dir.path().join("app.ts"),
+        "function alpha() {\n  return 1;\n}\n",
+    )
+    .unwrap();
     let mut config = LoomConfig::default_for_target(dir.path());
     config.embedding_dimensions = 3;
     config.enable_git_analysis = false;

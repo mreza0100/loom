@@ -2,7 +2,6 @@ mod server;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use loom_core::{store::LoomDb, LoomConfig};
 use rmcp::ServiceExt;
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
@@ -32,9 +31,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Status) => {
-            let config = LoomConfig::load(cli.target)?;
-            let db = LoomDb::open(config)?;
-            println!("{}", serde_json::to_string_pretty(&db.get_stats()?)?);
+            let state = server::LoomServerState::new(cli.target);
+            println!("{}", serde_json::to_string_pretty(&state.status()?)?);
         }
         Some(Command::Reindex) => {
             let state = server::LoomServerState::new(cli.target);

@@ -37,10 +37,20 @@ Log every response. Grade each: PASS / DEGRADE / CRASH.
 
 ## Step 1 — 360° the Loom tool surface
 
-Before touching any code, run the **360° protocol** (domain: `test`) on the
-subject: **"Loom MCP tools operating on a JavaScript codebase."**
+Before touching any code, spawn a separate clean-context agent to run the
+**360° protocol** (domain: `test`) on the subject:
+**"Loom MCP tools operating on a JavaScript codebase."**
 
-Walk every dimension:
+Use this exact prompt shape:
+
+```
+Read .claude/skills/360/SKILL.md and execute the protocol.
+Subject: Loom MCP tools operating on a JavaScript codebase.
+Domain: test
+Output the full 360° angle list grouped by dimension.
+```
+
+The 360° agent must walk every dimension:
 
 | Dimension | What to probe |
 |-----------|---------------|
@@ -102,7 +112,8 @@ Tasks that test whether Loom sees the FULL picture:
 For each of the 5 tasks:
 
 ### 3a. Pre-task 360°
-Run 360° (test domain) on the specific task: "What could go wrong when {task}?"
+Spawn a separate clean-context 360° agent (test domain) on the specific task:
+"What could go wrong when {task}?"
 Use this to decide which Loom tools to call and what to look for in results.
 
 ### 3b. Discovery (Loom-only navigation)

@@ -39,7 +39,7 @@ issues, or evolve the .claude infrastructure, you handle it.
 |----------|----------|----------------|
 | **Agent behavior** | "make QA check accessibility" | qa.md |
 | **Pipeline flow** | "add linting step before QA" | build.md, CLAUDE.md |
-| **Conventions** | "switch to ruff format" | CLAUDE.md, agents |
+| **Conventions** | "change the cargo fmt gate" | CLAUDE.md, agents |
 | **New command** | "add /deploy" | new command, CLAUDE.md |
 | **Script fix** | "dev.sh fails" | scripts |
 | **Character** | "JC feels off" | jc.md character section |

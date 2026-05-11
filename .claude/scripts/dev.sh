@@ -35,7 +35,7 @@ ensure_dirs() {
 
 check_prereqs() {
   local missing=0
-  for cmd in python3 uv; do
+  for cmd in cargo; do
     if ! command -v "$cmd" &>/dev/null; then
       fail "Missing: $cmd"
       missing=1
@@ -95,19 +95,14 @@ cmd_up() {
 
   check_prereqs
 
-  header "Dependencies"
-  (cd "$ROOT" && uv sync 2>&1 | tail -3) || true
-  ok "Dependencies installed"
-
   header "Starting Loom"
   : > "$PID_FILE"
 
-  # Run tests first to verify code is valid
   header "Verification"
-  if (cd "$ROOT" && uv run python -c "import loom" 2>/dev/null); then
-    ok "Loom module imports successfully"
+  if (cd "$ROOT" && cargo check --workspace >/dev/null); then
+    ok "Workspace checks successfully"
   else
-    warn "Loom module import check failed — may still be setting up"
+    warn "Workspace check failed"
   fi
 
   echo ""

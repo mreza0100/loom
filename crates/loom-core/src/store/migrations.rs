@@ -1,7 +1,7 @@
 use crate::{error::Result, store::vector::VectorStore};
 use rusqlite::Connection;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 4;
+pub const CURRENT_SCHEMA_VERSION: i64 = 5;
 
 pub fn run_migrations(
     conn: &Connection,
@@ -25,12 +25,17 @@ pub fn run_migrations(
         ensure_index_meta_embedding_fingerprint(conn)?;
         set_schema_version(conn, 4)?;
     }
+    if schema_version(conn)? < 5 {
+        create_signal_schema(conn)?;
+        set_schema_version(conn, 5)?;
+    }
 
     // Older Rust databases can have user_version = 0 while already carrying
     // current tables. Keep the guards idempotent so opening them upgrades cleanly.
     create_base_schema(conn)?;
     ensure_cochange_recency(conn)?;
     ensure_index_meta_embedding_fingerprint(conn)?;
+    create_signal_schema(conn)?;
     vector_store.create_schema(conn, dimensions)?;
     set_schema_version(conn, CURRENT_SCHEMA_VERSION)?;
     Ok(())
@@ -98,6 +103,84 @@ fn create_base_schema(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_cochange_a ON cochange(file_a);
         CREATE INDEX IF NOT EXISTS idx_cochange_b ON cochange(file_b);
+        ",
+    )?;
+    Ok(())
+}
+
+fn create_signal_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS behavior_facts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fact_type TEXT NOT NULL,
+            value TEXT NOT NULL,
+            file TEXT NOT NULL,
+            line INTEGER NOT NULL,
+            end_line INTEGER NOT NULL,
+            enclosing_symbol_id INTEGER REFERENCES symbols(id) ON DELETE SET NULL,
+            enclosing_symbol_name TEXT,
+            occurrence_count INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE INDEX IF NOT EXISTS idx_behavior_facts_file ON behavior_facts(file);
+        CREATE INDEX IF NOT EXISTS idx_behavior_facts_type_value ON behavior_facts(fact_type, value);
+        CREATE INDEX IF NOT EXISTS idx_behavior_facts_enclosing_symbol
+            ON behavior_facts(enclosing_symbol_id);
+        CREATE VIRTUAL TABLE IF NOT EXISTS behavior_facts_fts USING fts5(
+            fact_type, value, file, content=behavior_facts, content_rowid=id
+        );
+
+        CREATE TABLE IF NOT EXISTS aliases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file TEXT NOT NULL,
+            line INTEGER NOT NULL,
+            end_line INTEGER NOT NULL,
+            local_name TEXT NOT NULL,
+            imported_name TEXT NOT NULL,
+            source TEXT NOT NULL,
+            alias_kind TEXT NOT NULL,
+            enclosing_symbol_id INTEGER REFERENCES symbols(id) ON DELETE SET NULL,
+            enclosing_symbol_name TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_aliases_file ON aliases(file);
+        CREATE INDEX IF NOT EXISTS idx_aliases_local ON aliases(file, local_name);
+
+        CREATE TABLE IF NOT EXISTS callsites (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file TEXT NOT NULL,
+            line INTEGER NOT NULL,
+            end_line INTEGER NOT NULL,
+            callee TEXT NOT NULL,
+            receiver TEXT,
+            unresolved_target TEXT NOT NULL,
+            resolved_target_id INTEGER REFERENCES symbols(id) ON DELETE SET NULL,
+            argument_summaries TEXT NOT NULL DEFAULT '[]',
+            imported_aliases TEXT NOT NULL DEFAULT '[]',
+            enclosing_symbol_id INTEGER REFERENCES symbols(id) ON DELETE SET NULL,
+            enclosing_symbol_name TEXT,
+            confidence REAL NOT NULL DEFAULT 0.0,
+            generic INTEGER NOT NULL DEFAULT 0,
+            downweighted INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_callsites_file ON callsites(file);
+        CREATE INDEX IF NOT EXISTS idx_callsites_callee ON callsites(callee);
+        CREATE INDEX IF NOT EXISTS idx_callsites_enclosing_symbol
+            ON callsites(enclosing_symbol_id);
+        CREATE INDEX IF NOT EXISTS idx_callsites_resolved_target
+            ON callsites(resolved_target_id);
+
+        CREATE TABLE IF NOT EXISTS file_role_cards (
+            file TEXT PRIMARY KEY,
+            content_hash TEXT NOT NULL,
+            primary_responsibility TEXT NOT NULL,
+            exported_symbols TEXT NOT NULL DEFAULT '[]',
+            imported_dependencies TEXT NOT NULL DEFAULT '[]',
+            behavior_facts TEXT NOT NULL DEFAULT '[]',
+            centrality REAL NOT NULL DEFAULT 0.0,
+            tests_touching TEXT NOT NULL DEFAULT '[]',
+            top_related_files TEXT NOT NULL DEFAULT '[]',
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
         ",
     )?;
     Ok(())

@@ -1,7 +1,15 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub const CONTRACT_VERSION: u32 = 1;
+pub const SEARCH_CONTRACT: &str = "loom.search.response";
+pub const RELATED_CONTRACT: &str = "loom.related.response";
+pub const IMPACT_CONTRACT: &str = "loom.impact.response";
+pub const NEIGHBORHOOD_CONTRACT: &str = "loom.neighborhood.response";
+pub const INSPECT_CONTRACT: &str = "loom.inspect.response";
+pub const EVIDENCE_PACK_CONTRACT: &str = "loom.evidence_pack.response";
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Symbol {
     pub id: Option<i64>,
     pub name: String,
@@ -14,11 +22,129 @@ pub struct Symbol {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileAnchor {
+    pub file: String,
+    pub line: i64,
+    pub end_line: i64,
+}
+
+impl FileAnchor {
+    #[must_use]
+    pub fn from_symbol(symbol: &Symbol) -> Self {
+        Self {
+            file: symbol.file.clone(),
+            line: symbol.line,
+            end_line: symbol.end_line,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParsedEdge {
     pub source_name: String,
     pub target_name: String,
     pub relationship: String,
     pub target_file: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParsedBehaviorFact {
+    pub fact_type: String,
+    pub value: String,
+    pub line: i64,
+    pub end_line: i64,
+    pub enclosing_symbol_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BehaviorFact {
+    pub id: Option<i64>,
+    pub fact_type: String,
+    pub value: String,
+    pub file: String,
+    pub line: i64,
+    pub end_line: i64,
+    pub enclosing_symbol_id: Option<i64>,
+    pub enclosing_symbol_name: Option<String>,
+    pub occurrence_count: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BehaviorFactHit {
+    pub fact: BehaviorFact,
+    pub lexical_evidence: LexicalEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ParsedCallsite {
+    pub line: i64,
+    pub end_line: i64,
+    pub callee: String,
+    pub receiver: Option<String>,
+    pub unresolved_target: String,
+    pub argument_summaries: Vec<String>,
+    pub imported_aliases: Vec<String>,
+    pub enclosing_symbol_name: Option<String>,
+    pub confidence: f64,
+    pub generic: bool,
+    pub downweighted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Callsite {
+    pub id: Option<i64>,
+    pub file: String,
+    pub line: i64,
+    pub end_line: i64,
+    pub callee: String,
+    pub receiver: Option<String>,
+    pub unresolved_target: String,
+    pub resolved_target_id: Option<i64>,
+    pub argument_summaries: Vec<String>,
+    pub imported_aliases: Vec<String>,
+    pub enclosing_symbol_id: Option<i64>,
+    pub enclosing_symbol_name: Option<String>,
+    pub confidence: f64,
+    pub generic: bool,
+    pub downweighted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParsedAlias {
+    pub line: i64,
+    pub end_line: i64,
+    pub local_name: String,
+    pub imported_name: String,
+    pub source: String,
+    pub alias_kind: String,
+    pub enclosing_symbol_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AliasRecord {
+    pub id: Option<i64>,
+    pub file: String,
+    pub line: i64,
+    pub end_line: i64,
+    pub local_name: String,
+    pub imported_name: String,
+    pub source: String,
+    pub alias_kind: String,
+    pub enclosing_symbol_id: Option<i64>,
+    pub enclosing_symbol_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FileRoleCard {
+    pub file: String,
+    pub content_hash: String,
+    pub primary_responsibility: String,
+    pub exported_symbols: Vec<String>,
+    pub imported_dependencies: Vec<String>,
+    pub behavior_facts: Vec<String>,
+    pub centrality: f64,
+    pub tests_touching: Vec<String>,
+    pub top_related_files: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -77,11 +203,314 @@ pub struct SearchResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LexicalEvidence {
+    pub snippet: String,
+    pub matched_text: String,
+    pub rank: f64,
+    pub field: String,
+    pub reason: String,
+    pub match_kind: String,
+    pub sanitized_query: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FtsSearchResult {
+    pub symbol: Symbol,
+    pub evidence: LexicalEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CoupledHit {
+    pub handle: String,
+    pub file_handle: String,
+    pub rank: usize,
+    pub name: String,
+    pub kind: String,
+    pub language: String,
+    pub anchor: FileAnchor,
+    pub summary: String,
+    #[serde(skip)]
+    pub symbol: Symbol,
+    pub score: f64,
+    pub reason: String,
+    pub reason_codes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SymbolHit {
+    pub handle: String,
+    pub file_handle: String,
+    pub rank: usize,
+    pub name: String,
+    pub kind: String,
+    pub language: String,
+    pub anchor: FileAnchor,
+    pub summary: String,
+    #[serde(skip)]
+    pub symbol: Symbol,
+    pub score: f64,
+    pub reason_codes: Vec<String>,
+    pub lexical_evidence: Option<LexicalEvidence>,
+    pub coupled: Vec<CoupledHit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResponseEnvelope {
+    pub contract: String,
+    pub version: u32,
+    pub index_revision: String,
+    pub limit: usize,
+    pub truncated: bool,
+    pub inspect_required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResponseBudget {
+    pub unit: String,
+    pub requested: usize,
+    pub returned: usize,
+    pub omitted: usize,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SearchResponse {
+    pub contract: String,
+    pub version: u32,
+    pub index_revision: String,
+    pub limit: usize,
+    pub truncated: bool,
+    pub inspect_required: bool,
+    pub budget: ResponseBudget,
+    pub exact_hits: Vec<SymbolHit>,
+    pub beyond_grep: Vec<SymbolHit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SymbolQuery {
+    pub symbol: String,
+    pub file: Option<String>,
+    pub kind: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RelatedResponse {
+    pub contract: String,
+    pub version: u32,
+    pub index_revision: String,
+    pub limit: usize,
+    pub truncated: bool,
+    pub inspect_required: bool,
+    pub budget: ResponseBudget,
+    pub query: SymbolQuery,
+    pub results: Vec<CoupledHit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImpactResponse {
+    pub contract: String,
+    pub version: u32,
+    pub index_revision: String,
+    pub limit: usize,
+    pub truncated: bool,
+    pub inspect_required: bool,
+    pub budget: ResponseBudget,
+    pub query: SymbolQuery,
+    pub results: Vec<CoupledHit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NeighborhoodResponse {
+    pub contract: String,
+    pub version: u32,
+    pub index_revision: String,
+    pub limit: usize,
+    pub truncated: bool,
+    pub inspect_required: bool,
+    pub budget: ResponseBudget,
+    pub file: String,
+    pub line: i64,
+    pub anchor: Option<SymbolHit>,
+    pub coupled: Vec<CoupledHit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InspectSnippet {
+    pub anchor: FileAnchor,
+    pub start_line: i64,
+    pub end_line: i64,
+    pub text: String,
+    pub chars: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InspectPage {
+    pub line_offset: usize,
+    pub next_line_offset: Option<usize>,
+    pub refused: bool,
+    pub refusal_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InspectResponse {
+    pub contract: String,
+    pub version: u32,
+    pub index_revision: String,
+    pub limit: usize,
+    pub truncated: bool,
+    pub inspect_required: bool,
+    pub budget: ResponseBudget,
+    pub handle: String,
+    pub handle_kind: String,
+    pub stale: bool,
+    pub error: Option<String>,
+    pub anchor: Option<FileAnchor>,
+    pub snippet: Option<InspectSnippet>,
+    pub page: InspectPage,
+    pub display_text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvidenceCoverageItem {
+    pub item: String,
+    pub status: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvidencePackResponse {
+    pub contract: String,
+    pub version: u32,
+    pub index_revision: String,
+    pub limit: usize,
+    pub truncated: bool,
+    pub inspect_required: bool,
+    pub budget: ResponseBudget,
+    pub query: String,
+    pub exact_hits: Vec<SymbolHit>,
+    pub beyond_grep: Vec<SymbolHit>,
+    pub behavior_facts: Vec<BehaviorFactHit>,
+    pub role_cards: Vec<FileRoleCard>,
+    pub inspected_snippets: Vec<InspectSnippet>,
+    pub coverage_checklist: Vec<EvidenceCoverageItem>,
+    pub omitted: Vec<String>,
+    pub missing_concepts: Vec<String>,
+    pub display_text: String,
+}
+
+#[must_use]
+pub fn response_envelope(
+    contract: &str,
+    index_revision: String,
+    limit: usize,
+    truncated: bool,
+    inspect_required: bool,
+) -> ResponseEnvelope {
+    ResponseEnvelope {
+        contract: contract.to_string(),
+        version: CONTRACT_VERSION,
+        index_revision,
+        limit,
+        truncated,
+        inspect_required,
+    }
+}
+
+#[must_use]
+pub fn response_budget(
+    unit: &str,
+    requested: usize,
+    returned: usize,
+    omitted: usize,
+    truncated: bool,
+) -> ResponseBudget {
+    ResponseBudget {
+        unit: unit.to_string(),
+        requested,
+        returned,
+        omitted,
+        truncated,
+    }
+}
+
+#[must_use]
+pub fn symbol_handle(index_revision: &str, symbol: &Symbol) -> String {
+    if let Some(id) = symbol.id {
+        return format!("symbol:{index_revision}:{id}");
+    }
+    format!(
+        "symbol:{index_revision}:unindexed:{}:{}:{}",
+        stable_handle_part(&symbol.file),
+        symbol.line,
+        stable_handle_part(&symbol.name)
+    )
+}
+
+#[must_use]
+pub fn file_handle(index_revision: &str, file: &str) -> String {
+    format!("file:{index_revision}:{}", hex_encode(file.as_bytes()))
+}
+
+#[must_use]
+pub fn decode_file_handle_path(encoded: &str) -> Option<String> {
+    let bytes = hex_decode(encoded)?;
+    String::from_utf8(bytes).ok()
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
+fn hex_decode(value: &str) -> Option<Vec<u8>> {
+    if value.len() % 2 != 0 {
+        return None;
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|chunk| {
+            let high = hex_value(chunk[0])?;
+            let low = hex_value(chunk[1])?;
+            Some((high << 4) | low)
+        })
+        .collect()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn stable_handle_part(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| match character {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-' | '.' | '/' => character,
+            _ => '_',
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoreStats {
     pub symbols: i64,
     pub edges: i64,
     pub files: i64,
     pub vectors: i64,
+    pub behavior_facts: i64,
+    pub callsites: i64,
+    pub aliases: i64,
+    pub role_cards: i64,
     pub last_indexed: Option<String>,
     pub stale_files: i64,
     pub cochange_pairs: i64,
@@ -95,6 +524,13 @@ impl StoreStats {
             ("edges".to_string(), Some(self.edges.to_string())),
             ("files".to_string(), Some(self.files.to_string())),
             ("vectors".to_string(), Some(self.vectors.to_string())),
+            (
+                "behavior_facts".to_string(),
+                Some(self.behavior_facts.to_string()),
+            ),
+            ("callsites".to_string(), Some(self.callsites.to_string())),
+            ("aliases".to_string(), Some(self.aliases.to_string())),
+            ("role_cards".to_string(), Some(self.role_cards.to_string())),
             ("last_indexed".to_string(), self.last_indexed.clone()),
             (
                 "stale_files".to_string(),
