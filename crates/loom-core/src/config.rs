@@ -124,7 +124,7 @@ impl LoomConfig {
             semantic_weight: 0.35,
             evolutionary_weight: 0.20,
             coupling_threshold: 0.30,
-            top_coupled: 3,
+            top_coupled: 0,
             enable_git_analysis: true,
             git_max_commits: 500,
             git_max_files_per_commit: 20,
@@ -278,11 +278,6 @@ impl LoomConfig {
         if !self.coupling_threshold.is_finite() || !(0.0..=1.0).contains(&self.coupling_threshold) {
             return Err(LoomError::InvalidConfig(
                 "coupling_threshold must be between 0.0 and 1.0".to_string(),
-            ));
-        }
-        if self.top_coupled == 0 {
-            return Err(LoomError::InvalidConfig(
-                "top_coupled must be positive".to_string(),
             ));
         }
         if self.embedding_dimensions == 0 {

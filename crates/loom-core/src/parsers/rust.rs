@@ -5,9 +5,9 @@ use tree_sitter::Node;
 use crate::{
     parsers::{
         tree_sitter_utils::{
-            child_by_field, descendant_of_kind, edge, first_named_child_of_kind,
-            language_parse_result, path_parent, push_call_edges, qualified,
-            resolve_direct_or_candidates, symbol, text, walk_preorder, Scope,
+            child_by_field, edge, first_named_child_of_kind, language_parse_result, path_parent,
+            push_call_edges, qualified, resolve_direct_or_candidates, symbol, text, walk_preorder,
+            Scope,
         },
         LanguageAdapter, ParseResult,
     },
@@ -256,14 +256,22 @@ fn handle_enum(node: Node<'_>, source: &[u8], file_path: &str, result: &mut Pars
 
 fn handle_impl(node: Node<'_>, source: &[u8], file_path: &str, result: &mut ParseResult) {
     let impl_text = text(source, node);
-    let type_name = descendant_of_kind(node, &["type_identifier"])
-        .map(|type_node| text(source, type_node))
-        .unwrap_or_default();
-    if impl_text.contains(" for ") {
+    let (trait_name, type_name) = impl_header_names(&impl_text);
+    if let (Some(trait_name), Some(implementor)) = (trait_name.as_deref(), type_name.as_deref()) {
+        result
+            .edges
+            .push(edge(implementor, trait_name, "implements", None));
+        result
+            .edges
+            .push(edge(trait_name, implementor, "implemented_by", None));
+        walk_children_with_scope(node, source, file_path, result, Some(implementor));
+        return;
+    }
+    if impl_header_has_trait_for(&impl_text) {
         let mut types = Vec::new();
         walk_preorder(node, &mut |candidate| {
             if candidate.kind() == "type_identifier" {
-                types.push(text(source, candidate));
+                types.push(clean_impl_type_name(&text(source, candidate)));
             }
         });
         if types.len() >= 2 {
@@ -279,9 +287,80 @@ fn handle_impl(node: Node<'_>, source: &[u8], file_path: &str, result: &mut Pars
             return;
         }
     }
-    if !type_name.is_empty() {
+    if let Some(type_name) = type_name {
         walk_children_with_scope(node, source, file_path, result, Some(&type_name));
     }
+}
+
+fn impl_header_names(impl_text: &str) -> (Option<String>, Option<String>) {
+    let Some(header) = impl_text.split('{').next() else {
+        return (None, None);
+    };
+    let rest = header.trim().strip_prefix("impl").unwrap_or(header).trim();
+    let rest = strip_leading_impl_generics(rest);
+    if let Some((trait_name, implementor)) = rest.split_once(" for ") {
+        return (
+            nonempty_clean_impl_type_name(trait_name),
+            nonempty_clean_impl_type_name(implementor),
+        );
+    }
+    (None, nonempty_clean_impl_type_name(rest))
+}
+
+fn impl_header_has_trait_for(impl_text: &str) -> bool {
+    let Some(header) = impl_text.split('{').next() else {
+        return false;
+    };
+    let rest = header.trim().strip_prefix("impl").unwrap_or(header).trim();
+    strip_leading_impl_generics(rest).contains(" for ")
+}
+
+fn strip_leading_impl_generics(value: &str) -> &str {
+    let value = value.trim_start();
+    if !value.starts_with('<') {
+        return value;
+    }
+    let mut depth = 0_i32;
+    for (index, character) in value.char_indices() {
+        match character {
+            '<' => depth += 1,
+            '>' => {
+                depth -= 1;
+                if depth == 0 {
+                    return value[index + character.len_utf8()..].trim_start();
+                }
+            }
+            _ => {}
+        }
+    }
+    value
+}
+
+fn nonempty_clean_impl_type_name(value: &str) -> Option<String> {
+    let cleaned = clean_impl_type_name(value);
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+fn clean_impl_type_name(value: &str) -> String {
+    let mut cleaned = value.trim();
+    while let Some(stripped) = cleaned.strip_prefix('&') {
+        cleaned = stripped.trim_start();
+    }
+    cleaned
+        .split(" where ")
+        .next()
+        .unwrap_or(cleaned)
+        .split_whitespace()
+        .next()
+        .unwrap_or(cleaned)
+        .split('<')
+        .next()
+        .unwrap_or(cleaned)
+        .rsplit("::")
+        .next()
+        .unwrap_or(cleaned)
+        .trim()
+        .to_string()
 }
 
 fn handle_use(node: Node<'_>, source: &[u8], result: &mut ParseResult) {

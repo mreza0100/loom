@@ -3,6 +3,7 @@ pub mod vector;
 
 use crate::config::{LoomConfig, VectorBackendConfig};
 use crate::error::{LoomError, Result};
+use crate::indexer::{path, walk};
 use crate::models::{
     AliasRecord, BehaviorFact, BehaviorFactHit, Callsite, Edge, FileRoleCard, FtsSearchResult,
     LexicalEvidence, StoreStats, Symbol,
@@ -11,13 +12,15 @@ use migrations::run_migrations;
 use parking_lot::Mutex;
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
+use rayon::prelude::*;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::debug;
 use vector::{
     register_sqlite_vec_once, repeat_placeholders, BlobVectorStore, SqliteVecStore, VectorStore,
@@ -464,6 +467,19 @@ impl LoomDb {
         collect_rows(rows)
     }
 
+    pub fn get_behavior_fact_by_id(&self, fact_id: i64) -> Result<Option<BehaviorFact>> {
+        let conn = self.reader()?;
+        conn.query_row(
+            "SELECT id, fact_type, value, file, line, end_line,
+                    enclosing_symbol_id, enclosing_symbol_name, occurrence_count
+             FROM behavior_facts WHERE id = ?",
+            [fact_id],
+            row_to_behavior_fact,
+        )
+        .optional()
+        .map_err(LoomError::from)
+    }
+
     pub fn get_callsites_for_file(&self, file: &str) -> Result<Vec<Callsite>> {
         let conn = self.reader()?;
         let mut stmt = conn.prepare(
@@ -475,6 +491,20 @@ impl LoomDb {
         )?;
         let rows = stmt.query_map([file], row_to_callsite)?;
         collect_rows(rows)
+    }
+
+    pub fn get_callsite_by_id(&self, callsite_id: i64) -> Result<Option<Callsite>> {
+        let conn = self.reader()?;
+        conn.query_row(
+            "SELECT id, file, line, end_line, callee, receiver, unresolved_target,
+                    resolved_target_id, argument_summaries, imported_aliases,
+                    enclosing_symbol_id, enclosing_symbol_name, confidence, generic, downweighted
+             FROM callsites WHERE id = ?",
+            [callsite_id],
+            row_to_callsite,
+        )
+        .optional()
+        .map_err(LoomError::from)
     }
 
     pub fn get_aliases_for_file(&self, file: &str) -> Result<Vec<AliasRecord>> {
@@ -602,6 +632,90 @@ impl LoomDb {
         }
 
         Ok(Vec::new())
+    }
+
+    pub fn list_symbols(
+        &self,
+        query: &str,
+        file_prefix: Option<&str>,
+        kind: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Symbol>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = checked_sql_limit(limit)?;
+        let suffix_pattern = format!("%.{}", escape_like(query));
+        let contains_pattern = format!("%{}%", escape_like(query));
+        let mut sql = String::from(
+            "SELECT id, name, kind, file, line, end_line, language, context
+             FROM symbols
+             WHERE (name = ?1 OR name LIKE ?2 ESCAPE '\\' OR name LIKE ?3 ESCAPE '\\')",
+        );
+        let mut args = vec![query.to_string(), suffix_pattern, contains_pattern];
+        if let Some(prefix) = file_prefix {
+            sql.push_str(" AND file LIKE ? ESCAPE '\\'");
+            args.push(format!("{}%", escape_like(prefix)));
+        }
+        if let Some(kind) = kind {
+            sql.push_str(" AND kind = ?");
+            args.push(kind.to_string());
+        }
+        sql.push_str(
+            " ORDER BY
+                CASE
+                    WHEN name = ?1 THEN 0
+                    WHEN name LIKE ?2 ESCAPE '\\' THEN 1
+                    ELSE 2
+                END,
+                file, line, name
+              LIMIT ?",
+        );
+        args.push(limit.to_string());
+        let conn = self.reader()?;
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(args), row_to_symbol)?;
+        collect_rows(rows)
+    }
+
+    pub fn list_symbols_by_ordered_tokens(
+        &self,
+        query: &str,
+        file_prefix: Option<&str>,
+        kind: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Symbol>> {
+        let tokens = ordered_symbol_tokens(query);
+        if limit == 0 || tokens.len() < 2 {
+            return Ok(Vec::new());
+        }
+        let limit = checked_sql_limit(limit)?;
+        let pattern = format!("%{}%", tokens.join("%"));
+        let mut sql = String::from(
+            "SELECT id, name, kind, file, line, end_line, language, context
+             FROM symbols
+             WHERE (LOWER(name) LIKE ?1 ESCAPE '\\' OR LOWER(context) LIKE ?1 ESCAPE '\\')",
+        );
+        let mut args = vec![pattern];
+        if let Some(prefix) = file_prefix {
+            sql.push_str(" AND file LIKE ? ESCAPE '\\'");
+            args.push(format!("{}%", escape_like(prefix)));
+        }
+        if let Some(kind) = kind {
+            sql.push_str(" AND kind = ?");
+            args.push(kind.to_string());
+        }
+        sql.push_str(
+            " ORDER BY
+                CASE WHEN LOWER(name) LIKE ?1 ESCAPE '\\' THEN 0 ELSE 1 END,
+                file, line, name
+              LIMIT ?",
+        );
+        args.push(limit.to_string());
+        let conn = self.reader()?;
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(args), row_to_symbol)?;
+        collect_rows(rows)
     }
 
     pub fn get_colocated_symbols(&self, file: &str) -> Result<Vec<Symbol>> {
@@ -1028,35 +1142,68 @@ impl LoomDb {
         let conn = self.reader()?;
         let symbols = count_table(&conn, "symbols")?;
         let edges = count_table(&conn, "edges")?;
+        let resolved_edges = count_where(&conn, "edges", "target_id IS NOT NULL")?;
+        let unresolved_edges = count_where(&conn, "edges", "target_id IS NULL")?;
         let files = count_table(&conn, "index_meta")?;
         let vectors = self.vector_store.count(&conn)?;
         let last_indexed =
             conn.query_row("SELECT MAX(last_indexed) FROM index_meta", [], |row| {
                 row.get(0)
             })?;
-        let stale_files = conn.query_row(
-            "SELECT COUNT(*) FROM index_meta WHERE last_indexed < datetime('now', '-1 hour')",
-            [],
-            |row| row.get(0),
-        )?;
+        let indexed_hashes = indexed_file_hashes(&conn)?;
+        let stale_files = self.count_stale_files(&indexed_hashes)?;
         let cochange_pairs = count_table(&conn, "cochange")?;
         let behavior_facts = count_table(&conn, "behavior_facts")?;
         let callsites = count_table(&conn, "callsites")?;
+        let resolved_callsites = count_where(&conn, "callsites", "resolved_target_id IS NOT NULL")?;
+        let unresolved_callsites = count_where(&conn, "callsites", "resolved_target_id IS NULL")?;
         let aliases = count_table(&conn, "aliases")?;
         let role_cards = count_table(&conn, "file_role_cards")?;
         Ok(StoreStats {
             symbols,
             edges,
+            resolved_edges,
+            unresolved_edges,
             files,
             vectors,
             behavior_facts,
             callsites,
+            resolved_callsites,
+            unresolved_callsites,
             aliases,
             role_cards,
             last_indexed,
             stale_files,
             cochange_pairs,
         })
+    }
+
+    fn count_stale_files(&self, indexed_hashes: &BTreeMap<String, String>) -> Result<i64> {
+        let discovered = walk::discover_files(&self.config);
+        let checked = discovered
+            .par_iter()
+            .map(|file| {
+                let db_path = path::db_path_for(file, &self.config)?;
+                let content_hash = walk::hash_file(file)?;
+                let stale = !matches!(
+                    indexed_hashes.get(&db_path),
+                    Some(indexed_hash) if indexed_hash == &content_hash
+                );
+                Ok((db_path, stale))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let current_files = checked
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect::<BTreeSet<_>>();
+        let changed = checked.iter().filter(|(_, stale)| *stale).count() as i64;
+        let deleted = indexed_hashes
+            .keys()
+            .filter(|indexed_path| !current_files.contains(*indexed_path))
+            .count() as i64;
+
+        Ok(changed + deleted)
     }
 
     pub fn index_revision(&self) -> Result<String> {
@@ -1268,6 +1415,7 @@ fn classify_fts_match(query: &str) -> String {
 }
 
 fn apply_pragmas(conn: &Connection) -> Result<()> {
+    conn.busy_timeout(Duration::from_secs(5))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -1756,6 +1904,69 @@ fn filter_file_suffix(symbols: Vec<Symbol>, file: &str) -> Vec<Symbol> {
         .collect()
 }
 
+fn escape_like(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '%' | '_' | '\\' => {
+                output.push('\\');
+                output.push(ch);
+            }
+            _ => output.push(ch),
+        }
+    }
+    output
+}
+
+fn ordered_symbol_tokens(value: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for piece in value
+        .split(|character: char| !character.is_alphanumeric())
+        .map(str::trim)
+        .filter(|piece| !piece.is_empty())
+    {
+        push_identifier_tokens(piece, &mut tokens);
+    }
+    tokens.dedup();
+    tokens
+}
+
+fn push_identifier_tokens(piece: &str, tokens: &mut Vec<String>) {
+    let chars = piece.chars().collect::<Vec<_>>();
+    let mut pieces = Vec::new();
+    let mut start = 0;
+    for index in 1..chars.len() {
+        let prev = chars[index - 1];
+        let current = chars[index];
+        let next = chars.get(index + 1).copied();
+        let starts_word = (current.is_uppercase()
+            && (prev.is_lowercase() || prev.is_ascii_digit()))
+            || (prev.is_uppercase()
+                && current.is_uppercase()
+                && next.is_some_and(char::is_lowercase));
+        if starts_word {
+            push_identifier_piece(&chars[start..index], &mut pieces);
+            start = index;
+        }
+    }
+    push_identifier_piece(&chars[start..], &mut pieces);
+    if pieces.len() > 1 {
+        tokens.extend(pieces);
+    } else {
+        let lower = piece.to_lowercase();
+        if lower.chars().count() >= 2 {
+            tokens.push(lower);
+        }
+    }
+}
+
+fn push_identifier_piece(piece: &[char], tokens: &mut Vec<String>) {
+    let token = piece.iter().collect::<String>().to_lowercase();
+    if token.chars().count() >= 2 && tokens.last().is_none_or(|last| last != &token) {
+        tokens.push(token);
+    }
+}
+
 fn canonical_pair(left: &str, right: &str) -> (String, String) {
     if left <= right {
         (left.to_string(), right.to_string())
@@ -1768,6 +1979,26 @@ fn count_table(conn: &Connection, table: &str) -> Result<i64> {
     let sql = format!("SELECT COUNT(*) FROM {table}");
     conn.query_row(&sql, [], |row| row.get(0))
         .map_err(LoomError::from)
+}
+
+fn count_where(conn: &Connection, table: &str, predicate: &str) -> Result<i64> {
+    let sql = format!("SELECT COUNT(*) FROM {table} WHERE {predicate}");
+    conn.query_row(&sql, [], |row| row.get(0))
+        .map_err(LoomError::from)
+}
+
+fn indexed_file_hashes(conn: &Connection) -> Result<BTreeMap<String, String>> {
+    let mut stmt =
+        conn.prepare("SELECT file_path, content_hash FROM index_meta ORDER BY file_path")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut hashes = BTreeMap::new();
+    for row in rows {
+        let (file, hash) = row?;
+        hashes.insert(file, hash);
+    }
+    Ok(hashes)
 }
 
 fn checked_sql_limit(limit: usize) -> Result<i64> {

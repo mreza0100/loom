@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 
 pub const CONTRACT_VERSION: u32 = 1;
 pub const SEARCH_CONTRACT: &str = "loom.search.response";
+pub const SYMBOLS_CONTRACT: &str = "loom.symbols.response";
 pub const RELATED_CONTRACT: &str = "loom.related.response";
 pub const IMPACT_CONTRACT: &str = "loom.impact.response";
 pub const NEIGHBORHOOD_CONTRACT: &str = "loom.neighborhood.response";
@@ -73,6 +74,19 @@ pub struct BehaviorFact {
 pub struct BehaviorFactHit {
     pub fact: BehaviorFact,
     pub lexical_evidence: LexicalEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvidenceFactHit {
+    pub handle: String,
+    pub file_handle: String,
+    pub name: String,
+    pub kind: String,
+    pub anchor: FileAnchor,
+    pub summary: String,
+    pub fact: BehaviorFact,
+    pub lexical_evidence: LexicalEvidence,
+    pub reason_codes: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -189,10 +203,20 @@ impl CouplingScore {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GraphProvenance {
+    pub relationship: String,
+    pub direction: String,
+    pub depth: usize,
+    pub confidence: f64,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CoupledSymbol {
     pub symbol: Symbol,
     pub score: f64,
     pub reason: String,
+    pub provenance: Vec<GraphProvenance>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -234,6 +258,17 @@ pub struct CoupledHit {
     pub score: f64,
     pub reason: String,
     pub reason_codes: Vec<String>,
+    pub provenance: Vec<GraphProvenance>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SignalScores {
+    pub lexical: f64,
+    pub symbol: f64,
+    pub semantic: f64,
+    pub graph: f64,
+    pub behavior: f64,
+    pub total: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -249,9 +284,31 @@ pub struct SymbolHit {
     #[serde(skip)]
     pub symbol: Symbol,
     pub score: f64,
+    pub signal_scores: SignalScores,
     pub reason_codes: Vec<String>,
     pub lexical_evidence: Option<LexicalEvidence>,
     pub coupled: Vec<CoupledHit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NextToolSuggestion {
+    pub tool: String,
+    pub reason: String,
+    pub args: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Continuation {
+    pub cursor: String,
+    pub omitted: usize,
+    pub next_request_hint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QueryIntent {
+    pub intent: String,
+    pub confidence: f64,
+    pub reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -282,8 +339,28 @@ pub struct SearchResponse {
     pub truncated: bool,
     pub inspect_required: bool,
     pub budget: ResponseBudget,
+    pub continuation: Option<Continuation>,
+    pub next_tool_suggestions: Vec<NextToolSuggestion>,
+    pub query_intent: QueryIntent,
     pub exact_hits: Vec<SymbolHit>,
     pub beyond_grep: Vec<SymbolHit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SymbolListResponse {
+    pub contract: String,
+    pub version: u32,
+    pub index_revision: String,
+    pub limit: usize,
+    pub truncated: bool,
+    pub inspect_required: bool,
+    pub budget: ResponseBudget,
+    pub query: String,
+    pub file_prefix: Option<String>,
+    pub kind: Option<String>,
+    pub continuation: Option<Continuation>,
+    pub next_tool_suggestions: Vec<NextToolSuggestion>,
+    pub results: Vec<SymbolHit>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -303,6 +380,8 @@ pub struct RelatedResponse {
     pub inspect_required: bool,
     pub budget: ResponseBudget,
     pub query: SymbolQuery,
+    pub continuation: Option<Continuation>,
+    pub next_tool_suggestions: Vec<NextToolSuggestion>,
     pub results: Vec<CoupledHit>,
 }
 
@@ -316,6 +395,8 @@ pub struct ImpactResponse {
     pub inspect_required: bool,
     pub budget: ResponseBudget,
     pub query: SymbolQuery,
+    pub continuation: Option<Continuation>,
+    pub next_tool_suggestions: Vec<NextToolSuggestion>,
     pub results: Vec<CoupledHit>,
 }
 
@@ -331,6 +412,8 @@ pub struct NeighborhoodResponse {
     pub file: String,
     pub line: i64,
     pub anchor: Option<SymbolHit>,
+    pub continuation: Option<Continuation>,
+    pub next_tool_suggestions: Vec<NextToolSuggestion>,
     pub coupled: Vec<CoupledHit>,
 }
 
@@ -389,12 +472,13 @@ pub struct EvidencePackResponse {
     pub query: String,
     pub exact_hits: Vec<SymbolHit>,
     pub beyond_grep: Vec<SymbolHit>,
-    pub behavior_facts: Vec<BehaviorFactHit>,
+    pub behavior_facts: Vec<EvidenceFactHit>,
     pub role_cards: Vec<FileRoleCard>,
     pub inspected_snippets: Vec<InspectSnippet>,
     pub coverage_checklist: Vec<EvidenceCoverageItem>,
     pub omitted: Vec<String>,
     pub missing_concepts: Vec<String>,
+    pub next_tool_suggestions: Vec<NextToolSuggestion>,
     pub display_text: String,
 }
 
@@ -452,6 +536,32 @@ pub fn file_handle(index_revision: &str, file: &str) -> String {
 }
 
 #[must_use]
+pub fn behavior_fact_handle(index_revision: &str, fact: &BehaviorFact) -> String {
+    if let Some(id) = fact.id {
+        return format!("fact:{index_revision}:{id}");
+    }
+    format!(
+        "fact:{index_revision}:unindexed:{}:{}:{}",
+        stable_handle_part(&fact.file),
+        fact.line,
+        stable_handle_part(&fact.value)
+    )
+}
+
+#[must_use]
+pub fn callsite_handle(index_revision: &str, callsite: &Callsite) -> String {
+    if let Some(id) = callsite.id {
+        return format!("callsite:{index_revision}:{id}");
+    }
+    format!(
+        "callsite:{index_revision}:unindexed:{}:{}:{}",
+        stable_handle_part(&callsite.file),
+        callsite.line,
+        stable_handle_part(&callsite.unresolved_target)
+    )
+}
+
+#[must_use]
 pub fn decode_file_handle_path(encoded: &str) -> Option<String> {
     let bytes = hex_decode(encoded)?;
     String::from_utf8(bytes).ok()
@@ -505,10 +615,14 @@ fn stable_handle_part(value: &str) -> String {
 pub struct StoreStats {
     pub symbols: i64,
     pub edges: i64,
+    pub resolved_edges: i64,
+    pub unresolved_edges: i64,
     pub files: i64,
     pub vectors: i64,
     pub behavior_facts: i64,
     pub callsites: i64,
+    pub resolved_callsites: i64,
+    pub unresolved_callsites: i64,
     pub aliases: i64,
     pub role_cards: i64,
     pub last_indexed: Option<String>,
@@ -522,6 +636,14 @@ impl StoreStats {
         BTreeMap::from([
             ("symbols".to_string(), Some(self.symbols.to_string())),
             ("edges".to_string(), Some(self.edges.to_string())),
+            (
+                "resolved_edges".to_string(),
+                Some(self.resolved_edges.to_string()),
+            ),
+            (
+                "unresolved_edges".to_string(),
+                Some(self.unresolved_edges.to_string()),
+            ),
             ("files".to_string(), Some(self.files.to_string())),
             ("vectors".to_string(), Some(self.vectors.to_string())),
             (
@@ -529,6 +651,14 @@ impl StoreStats {
                 Some(self.behavior_facts.to_string()),
             ),
             ("callsites".to_string(), Some(self.callsites.to_string())),
+            (
+                "resolved_callsites".to_string(),
+                Some(self.resolved_callsites.to_string()),
+            ),
+            (
+                "unresolved_callsites".to_string(),
+                Some(self.unresolved_callsites.to_string()),
+            ),
             ("aliases".to_string(), Some(self.aliases.to_string())),
             ("role_cards".to_string(), Some(self.role_cards.to_string())),
             ("last_indexed".to_string(), self.last_indexed.clone()),

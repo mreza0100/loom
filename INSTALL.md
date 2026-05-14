@@ -84,11 +84,28 @@ The active runtime contract is documented in [docs/dev/runtime-contract.md](docs
 | Tool | What it does |
 |------|-------------|
 | `search(query)` | Hybrid retrieval with coupled-symbol expansion |
+| `symbols(query)` | Exact/suffix symbol enumeration for known names and repeated methods |
 | `related(symbol)` | Related symbols and relationship scores |
 | `impact(symbol)` | Ranked blast radius |
 | `neighborhood(file, line)` | Related code around a location |
+| `inspect(handle)` | Bounded source inspection for a selected Loom handle |
+| `evidence_pack(query)` | Citable evidence bundle for final answers |
 | `reindex()` | Re-index changed files |
 | `status()` | Index health |
+
+## CLI
+
+The MCP binary also exposes the same runtime as a CLI:
+
+```bash
+/path/to/loom/target/debug/loom-mcp --target /path/to/your/project reindex
+/path/to/loom/target/debug/loom-mcp --target /path/to/your/project search "findProjectSpec" --limit 5
+/path/to/loom/target/debug/loom-mcp --target /path/to/your/project symbols execute --file-prefix sources/commands --kind method
+/path/to/loom/target/debug/loom-mcp --target /path/to/your/project evidence-pack "package manager integrity"
+/path/to/loom/target/debug/loom-mcp --target /path/to/your/project inspect 'symbol:idx-...:42' --line-budget 24
+```
+
+JSON is the default output. Add `--format text` for a compact terminal view.
 
 ## Development
 

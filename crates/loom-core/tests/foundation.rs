@@ -224,6 +224,7 @@ fn model_serde_round_trips() {
         symbol: sym.clone(),
         score: 0.7,
         reason: "structural".to_string(),
+        provenance: Vec::new(),
     };
     let result = SearchResult {
         symbol: sym.clone(),
@@ -271,6 +272,7 @@ fn search_response_contract_json_shape_is_versioned() {
         summary: "function resolve_session() {}".to_string(),
         symbol: sym,
         score: 0.91,
+        signal_scores: Default::default(),
         reason_codes: vec!["exact:name".to_string(), "semantic".to_string()],
         lexical_evidence: Some(LexicalEvidence {
             snippet: "function resolve_session()".to_string(),
@@ -292,6 +294,13 @@ fn search_response_contract_json_shape_is_versioned() {
         truncated: envelope.truncated,
         inspect_required: envelope.inspect_required,
         budget: response_budget("results", 10, 1, 0, false),
+        continuation: None,
+        next_tool_suggestions: Vec::new(),
+        query_intent: loom_core::models::QueryIntent {
+            intent: "symbol".to_string(),
+            confidence: 0.9,
+            reasons: vec!["test fixture".to_string()],
+        },
         exact_hits: vec![hit],
         beyond_grep: Vec::new(),
     };
@@ -303,6 +312,7 @@ fn search_response_contract_json_shape_is_versioned() {
     assert_eq!(json["limit"], 10);
     assert_eq!(json["truncated"], false);
     assert_eq!(json["inspect_required"], true);
+    assert_eq!(json["query_intent"]["intent"], "symbol");
     assert_eq!(json["exact_hits"][0]["handle"], handle);
     assert_eq!(json["exact_hits"][0]["file_handle"], file_handle);
     assert_eq!(json["exact_hits"][0]["rank"], 1);

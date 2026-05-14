@@ -75,6 +75,9 @@ export function run() {
 class Service extends Base implements Runnable {
   start() { db.query(); }
 }
+export abstract class BaseCommand extends Command {
+  async setAndInstallLocalPackageManager() { return runVersion(); }
+}
 type Alias = string;
 interface Contract extends Parent {}
 "#;
@@ -83,7 +86,15 @@ interface Contract extends Parent {}
         parse_file(std::path::Path::new("sample.ts"), Some(source), &registry).expect("parse");
 
     let symbol_names = names(&result);
-    for expected in ["run", "Service", "Service.start", "Alias", "Contract"] {
+    for expected in [
+        "run",
+        "Service",
+        "Service.start",
+        "BaseCommand",
+        "BaseCommand.setAndInstallLocalPackageManager",
+        "Alias",
+        "Contract",
+    ] {
         assert!(symbol_names.contains(expected), "missing {expected}");
     }
     assert!(has_edge(&result, "fetchProduct", "getProduct", "imports"));
@@ -99,6 +110,12 @@ interface Contract extends Parent {}
         .any(|edge| edge.target_name == "console.log" && edge.relationship == "calls"));
     assert!(has_edge(&result, "run", "Widget", "instantiates"));
     assert!(has_edge(&result, "Service", "Base", "extends"));
+    assert!(has_edge(
+        &result,
+        "BaseCommand.setAndInstallLocalPackageManager",
+        "runVersion",
+        "calls"
+    ));
 }
 
 #[test]
@@ -182,6 +199,33 @@ macro_rules! work { () => {} }
     }
     assert!(has_edge(&rust, "Service", "Runner", "implements"));
     assert!(has_edge(&rust, "Service.run", "helper", "calls"));
+
+    let rust_impl = parse_file(
+        std::path::Path::new("store.rs"),
+        Some(
+            br#"
+struct LoomDb;
+struct LoomConfig;
+impl LoomDb {
+    pub fn new(config: LoomConfig) -> Self { LoomDb }
+    fn count_stale_files(&self) -> usize { 0 }
+}
+struct SearchEngine<E> { inner: E }
+trait Embedder {}
+impl<E: Embedder> SearchEngine<E> {
+    pub fn search(&self) { for _item in [] {} }
+}
+"#,
+        ),
+        &registry,
+    )
+    .expect("rust impl parse");
+    assert!(names(&rust_impl).contains("LoomDb.new"));
+    assert!(names(&rust_impl).contains("LoomDb.count_stale_files"));
+    assert!(names(&rust_impl).contains("SearchEngine.search"));
+    assert!(!names(&rust_impl).contains("LoomConfig.new"));
+    assert!(!names(&rust_impl).contains("LoomConfig.count_stale_files"));
+    assert!(!names(&rust_impl).contains("Embedder.search"));
 
     let csharp = parse_file(
         std::path::Path::new("Sample.cs"),

@@ -1,9 +1,9 @@
 use loom_core::{
     embedder::Embedder,
     graph::SymbolGraph,
-    models::{Edge, Symbol},
+    models::{BehaviorFact, Edge, FileRoleCard, Symbol},
     search::{compute_evolutionary, compute_semantic, compute_structural, fuse_signals},
-    store::LoomDb,
+    store::{FileIndexReplacement, LoomDb},
     LoomConfig, Result, SearchEngine,
 };
 use std::collections::BTreeSet;
@@ -101,6 +101,7 @@ fn search_returns_hybrid_results_with_coupled_symbols() {
     let mut config = LoomConfig::default_for_target(temp.path());
     config.embedding_dimensions = 3;
     config.enable_git_analysis = false;
+    config.top_coupled = 1;
     let db = Arc::new(LoomDb::open(config.clone()).unwrap());
     let resolver = db
         .insert_symbol(&symbol(
@@ -142,6 +143,14 @@ fn search_returns_hybrid_results_with_coupled_symbols() {
         .coupled
         .iter()
         .any(|entry| entry.symbol.name == "SessionValidator"));
+    let coupled_validator = resolver_result
+        .coupled
+        .iter()
+        .find(|entry| entry.symbol.name == "SessionValidator")
+        .unwrap();
+    assert_eq!(coupled_validator.provenance[0].relationship, "calls");
+    assert_eq!(coupled_validator.provenance[0].direction, "outgoing");
+    assert_eq!(coupled_validator.provenance[0].source, "graph.neighbors");
     let neighborhood = engine.neighborhood("src/session.ts", 2).unwrap();
     assert_eq!(neighborhood.anchor.unwrap().symbol.name, "resolve_session");
 }
@@ -273,9 +282,276 @@ fn search_contract_fixture_splits_exact_and_beyond_grep_deterministically() {
         .collect::<Vec<_>>();
     assert_eq!(first_order, second_order);
 
+    let broad = engine.search("needle", 500, None).unwrap();
+    assert!(broad.exact_hits.len() + broad.beyond_grep.len() <= 100);
+    assert_eq!(broad.limit, 100);
+    assert!(broad.truncated);
+
+    let capped = engine.search("needle", 1, None).unwrap();
+    assert!(capped.exact_hits.len() + capped.beyond_grep.len() <= 1);
+    assert!(capped.truncated);
+    assert!(capped.budget.omitted > 0);
+
     let empty_lexical = engine.search("!!!", 10, None).unwrap();
     assert!(empty_lexical.exact_hits.is_empty());
     assert!(!empty_lexical.beyond_grep.is_empty());
+}
+
+#[test]
+fn search_uses_bounded_file_line_rescue_for_exact_source_matches() {
+    let temp = tempfile::tempdir().unwrap();
+    let src_dir = temp.path().join("src");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::write(
+        src_dir.join("installer.ts"),
+        "export function verifyInstall() {\n  const marker = 'checksum verify tarball signature';\n  return marker.length > 0;\n}\n",
+    )
+    .unwrap();
+    let mut config = LoomConfig::default_for_target(temp.path());
+    config.embedding_dimensions = 3;
+    config.enable_git_analysis = false;
+    let db = Arc::new(LoomDb::open(config.clone()).unwrap());
+    let verifier = db
+        .insert_symbol(&symbol(
+            "verifyInstall",
+            "function",
+            "src/installer.ts",
+            1,
+            "export function verifyInstall() { return marker.length > 0; }",
+        ))
+        .unwrap();
+    db.set_file_hash("src/installer.ts", "hash").unwrap();
+    db.insert_embedding(verifier, &[0.0, 1.0, 0.0]).unwrap();
+    let engine = SearchEngine::new(
+        Arc::clone(&db),
+        Arc::new(MockEmbedder { dimensions: 3 }),
+        Some(Arc::new(SymbolGraph::build_from_db(&db).unwrap())),
+        config,
+    );
+
+    let response = engine
+        .search("checksum verify tarball signature", 5, None)
+        .unwrap();
+    let hit = response
+        .exact_hits
+        .iter()
+        .find(|hit| hit.symbol.name == "verifyInstall")
+        .unwrap();
+    assert!(hit.reason_codes.contains(&"exact:file_line".to_string()));
+    assert!(hit.signal_scores.lexical > 0.0);
+    let evidence = hit.lexical_evidence.as_ref().unwrap();
+    assert_eq!(evidence.field, "file_line");
+    assert_eq!(evidence.match_kind, "exact_phrase");
+    assert!(evidence.snippet.contains("checksum verify"));
+}
+
+#[test]
+fn search_file_line_rescue_does_not_anchor_top_level_text_to_nearest_symbol() {
+    let temp = tempfile::tempdir().unwrap();
+    let src_dir = temp.path().join("src");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::write(
+        src_dir.join("module.ts"),
+        "import 'top level marker phrase';\n\nexport function unrelated() {\n  return 1;\n}\n",
+    )
+    .unwrap();
+    let mut config = LoomConfig::default_for_target(temp.path());
+    config.embedding_dimensions = 3;
+    config.enable_git_analysis = false;
+    let db = Arc::new(LoomDb::open(config.clone()).unwrap());
+    let symbol_id = db
+        .insert_symbol(&symbol(
+            "unrelated",
+            "function",
+            "src/module.ts",
+            3,
+            "export function unrelated() { return 1; }",
+        ))
+        .unwrap();
+    db.set_file_hash("src/module.ts", "hash").unwrap();
+    db.insert_embedding(symbol_id, &[0.0, 1.0, 0.0]).unwrap();
+    let engine = SearchEngine::new(
+        Arc::clone(&db),
+        Arc::new(MockEmbedder { dimensions: 3 }),
+        Some(Arc::new(SymbolGraph::build_from_db(&db).unwrap())),
+        config,
+    );
+
+    let response = engine.search("top level marker phrase", 5, None).unwrap();
+    assert!(!response
+        .exact_hits
+        .iter()
+        .any(|hit| hit.reason_codes.contains(&"exact:file_line".to_string())));
+}
+
+#[test]
+fn search_file_line_rescue_anchors_to_smallest_containing_symbol() {
+    let temp = tempfile::tempdir().unwrap();
+    let src_dir = temp.path().join("src");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::write(
+        src_dir.join("command.ts"),
+        "export class CacheCommand {\n  async execute() {\n    return 'needle execute marker';\n  }\n}\n",
+    )
+    .unwrap();
+    let mut config = LoomConfig::default_for_target(temp.path());
+    config.embedding_dimensions = 3;
+    config.enable_git_analysis = false;
+    let db = Arc::new(LoomDb::open(config.clone()).unwrap());
+    let mut class_symbol = symbol(
+        "CacheCommand",
+        "class",
+        "src/command.ts",
+        1,
+        "export class CacheCommand {}",
+    );
+    class_symbol.end_line = 5;
+    let class_id = db.insert_symbol(&class_symbol).unwrap();
+    let mut method_symbol = symbol(
+        "CacheCommand.execute",
+        "method",
+        "src/command.ts",
+        2,
+        "async execute() { return 'needle execute marker'; }",
+    );
+    method_symbol.end_line = 4;
+    let method_id = db.insert_symbol(&method_symbol).unwrap();
+    db.set_file_hash("src/command.ts", "hash").unwrap();
+    db.insert_embedding(class_id, &[0.0, 1.0, 0.0]).unwrap();
+    db.insert_embedding(method_id, &[0.0, 1.0, 0.0]).unwrap();
+    let engine = SearchEngine::new(
+        Arc::clone(&db),
+        Arc::new(MockEmbedder { dimensions: 3 }),
+        Some(Arc::new(SymbolGraph::build_from_db(&db).unwrap())),
+        config,
+    );
+
+    let response = engine.search("needle execute marker", 10, None).unwrap();
+    assert!(response
+        .exact_hits
+        .iter()
+        .any(|hit| hit.name == "CacheCommand.execute"
+            && hit.reason_codes.contains(&"exact:file_line".to_string())));
+    assert!(!response
+        .exact_hits
+        .iter()
+        .any(|hit| hit.name == "CacheCommand"
+            && hit.reason_codes.contains(&"exact:file_line".to_string())));
+}
+
+#[test]
+fn symbols_enumerates_method_suffixes_with_file_prefix_and_kind() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = LoomConfig::default_for_target(temp.path());
+    config.embedding_dimensions = 3;
+    config.enable_git_analysis = false;
+    let db = Arc::new(LoomDb::open(config.clone()).unwrap());
+    for (name, kind, file, line) in [
+        (
+            "UseCommand.execute",
+            "method",
+            "sources/commands/Use.ts",
+            25,
+        ),
+        ("UpCommand.execute", "method", "sources/commands/Up.ts", 33),
+        (
+            "InstallLocalCommand.execute",
+            "method",
+            "sources/commands/InstallLocal.ts",
+            21,
+        ),
+        (
+            "InstallLocalCommand.executeFlag",
+            "variable",
+            "sources/commands/InstallLocal.ts",
+            22,
+        ),
+        ("Engine.execute", "method", "sources/Engine.ts", 99),
+        ("executeHelper", "function", "sources/commands/helper.ts", 4),
+    ] {
+        db.insert_symbol(&symbol(name, kind, file, line, "async execute() {}"))
+            .unwrap();
+    }
+    let engine = SearchEngine::new(
+        Arc::clone(&db),
+        Arc::new(MockEmbedder { dimensions: 3 }),
+        Some(Arc::new(SymbolGraph::build_from_db(&db).unwrap())),
+        config,
+    );
+
+    let response = engine
+        .symbols("execute", Some("sources/commands"), Some("method"), 10)
+        .unwrap();
+    assert_eq!(response.contract, "loom.symbols.response");
+    assert!(!response.truncated);
+    let names = response
+        .results
+        .iter()
+        .map(|hit| hit.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        vec![
+            "InstallLocalCommand.execute",
+            "UpCommand.execute",
+            "UseCommand.execute",
+        ]
+    );
+    assert!(response.results.iter().all(|hit| hit
+        .reason_codes
+        .contains(&"symbol:method_suffix".to_string())));
+    assert!(response
+        .results
+        .iter()
+        .all(|hit| hit.anchor.file.starts_with("sources/commands")));
+
+    let relaxed = engine
+        .symbols(
+            "InstallLocalCommand.execute",
+            Some("sources/commands"),
+            Some("function"),
+            5,
+        )
+        .unwrap();
+    assert_eq!(relaxed.results.len(), 1);
+    assert_eq!(relaxed.results[0].name, "InstallLocalCommand.execute");
+    assert_eq!(relaxed.results[0].kind, "method");
+    assert!(relaxed.results[0]
+        .reason_codes
+        .contains(&"kind:relaxed-function-method".to_string()));
+
+    let search = engine
+        .search("InstallLocalCommand.execute", 5, Some("function"))
+        .unwrap();
+    assert_eq!(search.exact_hits.len(), 1);
+    assert_eq!(search.exact_hits[0].name, "InstallLocalCommand.execute");
+    assert_eq!(search.exact_hits[0].kind, "method");
+    assert!(search.exact_hits[0]
+        .reason_codes
+        .contains(&"symbol:exact".to_string()));
+
+    let token_search = engine
+        .search("install local command execute", 5, None)
+        .unwrap();
+    assert!(token_search
+        .exact_hits
+        .iter()
+        .any(|hit| hit.name == "InstallLocalCommand.execute"
+            && hit
+                .reason_codes
+                .contains(&"symbol:ordered_tokens".to_string())));
+
+    let camel_search = engine
+        .search("InstallLocalCommandExecute", 5, None)
+        .unwrap();
+    assert_eq!(camel_search.query_intent.intent, "symbol");
+    assert!(camel_search
+        .exact_hits
+        .iter()
+        .any(|hit| hit.name == "InstallLocalCommand.execute"
+            && hit
+                .reason_codes
+                .contains(&"symbol:ordered_tokens".to_string())));
 }
 
 #[test]
@@ -334,6 +610,7 @@ fn inspect_resolves_symbol_and_file_handles_with_budgets_and_stale_guidance() {
         .inspect(&format!("symbol:idx-stale:{exact}"), 2, 80, 0)
         .unwrap();
     assert!(stale.stale);
+    assert!(stale.snippet.is_some());
     assert!(stale.error.unwrap().contains("rerun search"));
 }
 
@@ -355,6 +632,11 @@ fn evidence_pack_returns_citable_bounded_proof_bundle() {
     std::fs::write(
         src_dir.join("graph.ts"),
         "function graphOnly() {\n  return true;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src_dir.join("fact.ts"),
+        "function strictMode() {\n  return process.env.COREPACK_ENABLE_STRICT;\n}\n",
     )
     .unwrap();
     let mut config = LoomConfig::default_for_target(temp.path());
@@ -396,6 +678,52 @@ fn evidence_pack_returns_citable_bounded_proof_bundle() {
     db.insert_embedding(exact, &[0.0, 1.0, 0.0]).unwrap();
     db.insert_embedding(semantic, &[0.0, 1.0, 0.0]).unwrap();
     db.insert_embedding(graph_only, &[1.0, 0.0, 0.0]).unwrap();
+    let fact_symbols = vec![symbol(
+        "strictMode",
+        "function",
+        "src/fact.ts",
+        1,
+        "function strictMode() { return process.env.COREPACK_ENABLE_STRICT; }",
+    )];
+    let fact_embeddings = vec![vec![0.0, 1.0, 0.0]];
+    let facts = vec![BehaviorFact {
+        id: None,
+        fact_type: "env_var".to_string(),
+        value: "COREPACK_ENABLE_STRICT".to_string(),
+        file: "src/fact.ts".to_string(),
+        line: 2,
+        end_line: 2,
+        enclosing_symbol_id: None,
+        enclosing_symbol_name: Some("strictMode".to_string()),
+        occurrence_count: 1,
+    }];
+    let role_card = FileRoleCard {
+        file: "src/fact.ts".to_string(),
+        content_hash: "hash-fact".to_string(),
+        primary_responsibility: "strict mode env lookup".to_string(),
+        exported_symbols: vec!["strictMode".to_string()],
+        imported_dependencies: Vec::new(),
+        behavior_facts: vec!["env_var:COREPACK_ENABLE_STRICT".to_string()],
+        centrality: 0.0,
+        tests_touching: Vec::new(),
+        top_related_files: Vec::new(),
+    };
+    db.replace_file_index(
+        FileIndexReplacement {
+            path: "src/fact.ts",
+            content_hash: "hash-fact",
+            symbols: &fact_symbols,
+            embeddings: &fact_embeddings,
+            embedding_fingerprint: "test-fingerprint",
+            behavior_facts: &facts,
+            callsites: &[],
+            aliases: &[],
+            role_card: &role_card,
+        },
+        |_| Ok(Vec::new()),
+    )
+    .unwrap();
+    db.resolve_signal_enclosures().unwrap();
     let engine = SearchEngine::new(
         Arc::clone(&db),
         Arc::new(MockEmbedder { dimensions: 3 }),
@@ -417,6 +745,29 @@ fn evidence_pack_returns_citable_bounded_proof_bundle() {
         .coverage_checklist
         .iter()
         .any(|item| item.item == "source_snippets" && item.status == "included"));
+    let env_pack = engine.evidence_pack("COREPACK_ENABLE_STRICT", 600).unwrap();
+    let fact_hit = env_pack
+        .behavior_facts
+        .iter()
+        .find(|hit| hit.fact.value == "COREPACK_ENABLE_STRICT")
+        .unwrap();
+    assert!(fact_hit.handle.starts_with("fact:"));
+    assert_eq!(fact_hit.name, "COREPACK_ENABLE_STRICT");
+    assert_eq!(fact_hit.kind, "env_var");
+    assert!(fact_hit.summary.contains("COREPACK_ENABLE_STRICT"));
+    assert!(fact_hit
+        .reason_codes
+        .iter()
+        .any(|reason| reason == "fact:env_var"));
+    assert_eq!(fact_hit.anchor.file, "src/fact.ts");
+    let inspected_fact = engine.inspect(&fact_hit.handle, 1, 120, 0).unwrap();
+    assert_eq!(inspected_fact.handle_kind, "fact");
+    assert!(inspected_fact
+        .snippet
+        .as_ref()
+        .unwrap()
+        .text
+        .contains("COREPACK_ENABLE_STRICT"));
     assert!(pack.display_text.contains("Evidence pack"));
 }
 
@@ -459,10 +810,104 @@ fn impact_includes_unresolved_name_callers() {
         .results
         .iter()
         .any(|entry| entry.symbol.name == "make_session"));
+    let caller = impact
+        .results
+        .iter()
+        .find(|entry| entry.symbol.name == "make_session")
+        .unwrap();
+    assert_eq!(caller.provenance[0].source, "unresolved_name_edge");
+    assert_eq!(caller.provenance[0].relationship, "calls");
     assert_eq!(
         db.get_symbol_by_id(target).unwrap().unwrap().name,
         "SessionValidator"
     );
+}
+
+#[test]
+fn impact_kind_selects_target_without_filtering_callers() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = LoomConfig::default_for_target(temp.path());
+    config.embedding_dimensions = 3;
+    config.enable_git_analysis = false;
+    let db = Arc::new(LoomDb::open(config.clone()).unwrap());
+    let target = db
+        .insert_symbol(&symbol(
+            "runVersion",
+            "function",
+            "src/corepackUtils.ts",
+            10,
+            "export async function runVersion() {}",
+        ))
+        .unwrap();
+    let method_caller = db
+        .insert_symbol(&symbol(
+            "Engine.executePackageManagerRequest",
+            "method",
+            "src/Engine.ts",
+            30,
+            "async executePackageManagerRequest() { return corepackUtils.runVersion(); }",
+        ))
+        .unwrap();
+    db.insert_edge(&edge(method_caller, target, "runVersion", "calls"))
+        .unwrap();
+    let engine = SearchEngine::new(
+        Arc::clone(&db),
+        Arc::new(MockEmbedder { dimensions: 3 }),
+        Some(Arc::new(SymbolGraph::build_from_db(&db).unwrap())),
+        config,
+    );
+
+    let impact = engine
+        .impact("runVersion", Some("src/corepackUtils.ts"), Some("function"))
+        .unwrap();
+    assert!(impact
+        .results
+        .iter()
+        .any(|entry| entry.symbol.name == "Engine.executePackageManagerRequest"));
+}
+
+#[test]
+fn related_kind_selects_target_without_filtering_neighbors() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = LoomConfig::default_for_target(temp.path());
+    config.embedding_dimensions = 3;
+    config.enable_git_analysis = false;
+    config.coupling_threshold = 0.0;
+    let db = Arc::new(LoomDb::open(config.clone()).unwrap());
+    let target = db
+        .insert_symbol(&symbol(
+            "targetFn",
+            "function",
+            "src/a.ts",
+            1,
+            "function targetFn() {}",
+        ))
+        .unwrap();
+    let method_neighbor = db
+        .insert_symbol(&symbol(
+            "Widget.execute",
+            "method",
+            "src/widget.ts",
+            10,
+            "async execute() { return targetFn(); }",
+        ))
+        .unwrap();
+    db.insert_edge(&edge(method_neighbor, target, "targetFn", "calls"))
+        .unwrap();
+    let engine = SearchEngine::new(
+        Arc::clone(&db),
+        Arc::new(MockEmbedder { dimensions: 3 }),
+        Some(Arc::new(SymbolGraph::build_from_db(&db).unwrap())),
+        config,
+    );
+
+    let related = engine
+        .related("targetFn", Some("src/a.ts"), Some("function"))
+        .unwrap();
+    assert!(related
+        .results
+        .iter()
+        .any(|entry| entry.symbol.name == "Widget.execute"));
 }
 
 #[test]

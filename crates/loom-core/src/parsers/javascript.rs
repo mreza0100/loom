@@ -102,7 +102,7 @@ fn walk_node(
             }
             return;
         }
-        "class_declaration" | "interface_declaration" => {
+        "class_declaration" | "abstract_class_declaration" | "interface_declaration" => {
             if let Some(name_node) = child_by_field(node, "name")
                 .or_else(|| first_named_child_of_kind(node, &["identifier", "type_identifier"]))
             {

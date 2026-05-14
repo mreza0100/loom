@@ -2,7 +2,10 @@ use loom_core::{
     embedder::DefaultEmbedder,
     graph::SymbolGraph,
     indexer::IndexPipeline,
-    models::StoreStats,
+    models::{
+        EvidencePackResponse, ImpactResponse, InspectResponse, NeighborhoodResponse,
+        RelatedResponse, SearchResponse, StoreStats, SymbolListResponse,
+    },
     store::LoomDb,
     watcher::{FnChangeHandler, LoomWatcher},
     IndexResult, LoomConfig, SearchEngine,
@@ -18,7 +21,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
 use tracing::{error, warn};
 
-const MAX_LIMIT: usize = 100;
 const MAX_QUERY_BYTES: usize = 4_096;
 const MAX_SYMBOL_BYTES: usize = 512;
 const MAX_FILE_BYTES: usize = 2_048;
@@ -27,18 +29,31 @@ const MAX_INSPECT_LINES: usize = 120;
 const MAX_INSPECT_CHARS: usize = 16_000;
 const MAX_INSPECT_LINE_OFFSET: usize = 1_000_000;
 const MAX_EVIDENCE_BUDGET_TOKENS: usize = 8_000;
+const MCP_SEARCH_LIMIT: usize = 100;
+const MCP_SYMBOL_LIMIT: usize = 256;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SearchRequest {
     #[schemars(
-        description = "Natural language or code terms. Use Loom search before grep when you do not know the exact file or symbol."
+        description = "Natural language or code terms. Use Loom search before grep when you do not know the exact file or symbol; use symbols instead for exact same-name enumeration."
     )]
     pub query: String,
     #[schemars(
-        description = "Maximum ranked symbols to return, from 1 to 100. Default is 10; start small."
+        description = "Optional exact symbol kind filter, such as function, class, method, variable, interface, or struct."
     )]
-    #[serde(default = "default_limit")]
-    pub limit: usize,
+    pub kind: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SymbolListRequest {
+    #[schemars(
+        description = "Exact symbol or method suffix to enumerate, such as execute or Engine.resolveDescriptor. Use this before grep for same-name symbols."
+    )]
+    pub query: String,
+    #[schemars(
+        description = "Optional repo-relative file prefix, such as sources/commands, to bound enumeration."
+    )]
+    pub file_prefix: Option<String>,
     #[schemars(
         description = "Optional exact symbol kind filter, such as function, class, method, variable, interface, or struct."
     )]
@@ -80,12 +95,12 @@ pub struct InspectRequest {
     )]
     pub handle: String,
     #[schemars(
-        description = "Maximum source lines to return, from 1 to 120. Use pagination via line_offset instead of broad file reads."
+        description = "Preferred source line budget is 1 to 32. Larger accepted values are capped by Loom; use pagination via line_offset instead of broad file reads."
     )]
     #[serde(default = "default_inspect_lines")]
     pub line_budget: usize,
     #[schemars(
-        description = "Maximum source characters to return, from 1 to 16000. Smaller budgets keep MCP answers compact."
+        description = "Preferred source character budget is 1 to 2000. Larger accepted values are capped by Loom; smaller budgets keep MCP answers compact."
     )]
     #[serde(default = "default_inspect_chars")]
     pub char_budget: usize,
@@ -102,14 +117,23 @@ pub struct EvidencePackRequest {
         description = "Question or code concept to prove. Run before a final answer when citations are needed."
     )]
     pub query: String,
-    #[schemars(description = "Approximate token budget for the evidence bundle, from 1 to 8000.")]
+    #[schemars(
+        description = "Preferred token budget for the evidence bundle is 1 to 3000. Larger accepted values are capped by Loom."
+    )]
     #[serde(default = "default_evidence_budget_tokens")]
     pub budget_tokens: usize,
 }
 
 #[derive(Debug, Serialize)]
+pub struct IndexHealth {
+    pub status: String,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct StatusResponse {
     pub stats: StoreStats,
+    pub health: IndexHealth,
     pub graph_nodes: usize,
     pub graph_edges: usize,
     pub vector_backend: String,
@@ -149,8 +173,17 @@ impl LoomServerState {
         let core = self.core()?;
         let graph = core.lock_graph();
         let embedder_status = core.embedder_status_or_config();
+        let watcher_active = core.watcher_active();
+        let stats = core.db.get_stats()?;
+        let health = index_health(
+            &stats,
+            &embedder_status,
+            core.config.auto_watch,
+            watcher_active,
+        );
         Ok(StatusResponse {
-            stats: core.db.get_stats()?,
+            stats,
+            health,
             graph_nodes: graph.node_count(),
             graph_edges: graph.edge_count(),
             vector_backend: core.db.vector_backend_name().to_string(),
@@ -159,7 +192,7 @@ impl LoomServerState {
             embedder_model: embedder_status.model,
             embedder_dimensions: Some(embedder_status.dimensions),
             schema_version: core.db.schema_version()?,
-            watcher_active: core.watcher_active(),
+            watcher_active,
             auto_watch: core.config.auto_watch,
         })
     }
@@ -172,6 +205,67 @@ impl LoomServerState {
         let result = pipeline.full_index()?;
         core.refresh_graph()?;
         Ok(result)
+    }
+
+    pub fn search(
+        &self,
+        query: &str,
+        limit: usize,
+        kind: Option<&str>,
+    ) -> loom_core::Result<SearchResponse> {
+        self.search_engine()?.search(query, limit, kind)
+    }
+
+    pub fn symbols(
+        &self,
+        query: &str,
+        file_prefix: Option<&str>,
+        kind: Option<&str>,
+        limit: usize,
+    ) -> loom_core::Result<SymbolListResponse> {
+        self.search_engine()?
+            .symbols(query, file_prefix, kind, limit)
+    }
+
+    pub fn related(
+        &self,
+        symbol: &str,
+        file: Option<&str>,
+        kind: Option<&str>,
+    ) -> loom_core::Result<RelatedResponse> {
+        self.search_engine()?.related(symbol, file, kind)
+    }
+
+    pub fn impact(
+        &self,
+        symbol: &str,
+        file: Option<&str>,
+        kind: Option<&str>,
+    ) -> loom_core::Result<ImpactResponse> {
+        self.search_engine()?.impact(symbol, file, kind)
+    }
+
+    pub fn neighborhood(&self, file: &str, line: i64) -> loom_core::Result<NeighborhoodResponse> {
+        self.search_engine()?.neighborhood(file, line)
+    }
+
+    pub fn inspect(
+        &self,
+        handle: &str,
+        line_budget: usize,
+        char_budget: usize,
+        line_offset: usize,
+    ) -> loom_core::Result<InspectResponse> {
+        self.search_engine()?
+            .inspect(handle, line_budget, char_budget, line_offset)
+    }
+
+    pub fn evidence_pack(
+        &self,
+        query: &str,
+        budget_tokens: usize,
+    ) -> loom_core::Result<EvidencePackResponse> {
+        self.search_engine()?.evidence_pack(query, budget_tokens)
     }
 
     fn search_engine(&self) -> loom_core::Result<SearchEngine<DefaultEmbedder>> {
@@ -209,6 +303,52 @@ impl LoomServerState {
         }
         *guard = Some(Arc::clone(&core));
         Ok(core)
+    }
+}
+
+fn index_health(
+    stats: &StoreStats,
+    embedder_status: &loom_core::embedder::EmbedderStatus,
+    auto_watch: bool,
+    watcher_active: bool,
+) -> IndexHealth {
+    let mut warnings = Vec::new();
+    if stats.stale_files > 0 {
+        warnings.push(format!(
+            "{} stale or unindexed files; run reindex before trusting impact/search exhaustiveness",
+            stats.stale_files
+        ));
+    }
+    if auto_watch && !watcher_active {
+        warnings.push("auto_watch is enabled but the watcher is not active".to_string());
+    }
+    if embedder_status.degraded {
+        warnings.push("embedder is running in degraded fallback mode".to_string());
+    }
+    if stats.edges > 0 && stats.unresolved_edges > stats.resolved_edges.saturating_mul(3) {
+        warnings.push(format!(
+            "high unresolved edge ratio: {} unresolved vs {} resolved",
+            stats.unresolved_edges, stats.resolved_edges
+        ));
+    }
+    if stats.callsites > 0
+        && stats.unresolved_callsites > stats.resolved_callsites.saturating_mul(3)
+    {
+        warnings.push(format!(
+            "high unresolved callsite ratio: {} unresolved vs {} resolved",
+            stats.unresolved_callsites, stats.resolved_callsites
+        ));
+    }
+    let status = if stats.stale_files > 0 || embedder_status.degraded {
+        "stale_or_degraded"
+    } else if warnings.is_empty() {
+        "healthy"
+    } else {
+        "attention"
+    };
+    IndexHealth {
+        status: status.to_string(),
+        warnings,
     }
 }
 
@@ -322,7 +462,14 @@ impl CoreState {
 impl SearchRequest {
     fn validate(&self) -> Result<(), ErrorData> {
         validate_nonempty("query", &self.query, MAX_QUERY_BYTES)?;
-        validate_limit(self.limit)?;
+        validate_optional("kind", self.kind.as_deref(), MAX_SYMBOL_BYTES)
+    }
+}
+
+impl SymbolListRequest {
+    fn validate(&self) -> Result<(), ErrorData> {
+        validate_nonempty("query", &self.query, MAX_SYMBOL_BYTES)?;
+        validate_optional("file_prefix", self.file_prefix.as_deref(), MAX_FILE_BYTES)?;
         validate_optional("kind", self.kind.as_deref(), MAX_SYMBOL_BYTES)
     }
 }
@@ -381,7 +528,7 @@ impl LoomMcpServer {
 #[tool_router]
 impl LoomMcpServer {
     #[tool(
-        description = "Read-only first step for code discovery. Returns compact exact_hits and beyond_grep handles, anchors, summaries, reasons, and budget metadata; inspect only chosen handles next.",
+        description = "Read-only first step for conceptual code discovery. The model does not choose a result limit; Loom returns the complete internally bounded exact_hits and beyond_grep set with handles, anchors, summaries, reasons, and budget metadata. Use symbols for exact enumeration, evidence_pack for broad proof, and inspect only chosen handles next.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub fn search(
@@ -391,13 +538,34 @@ impl LoomMcpServer {
         request.validate()?;
         let engine = self.state.search_engine().map_err(to_mcp_error)?;
         let results = engine
-            .search(&request.query, request.limit, request.kind.as_deref())
+            .search(&request.query, MCP_SEARCH_LIMIT, request.kind.as_deref())
             .map_err(to_mcp_error)?;
         json_content(results)
     }
 
     #[tool(
-        description = "Read-only expansion after search. Returns compact coupled handles and anchors from Loom; pass file to disambiguate duplicate names, then inspect selected handles.",
+        description = "Read-only exact symbol enumerator. The model does not choose a result limit; Loom returns every internally bounded matching symbol. Use before grep for same-name methods or known symbols, for example query=execute file_prefix=sources/commands kind=method; returns compact handles for selective inspect.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    pub fn symbols(
+        &self,
+        Parameters(request): Parameters<SymbolListRequest>,
+    ) -> Result<Content, ErrorData> {
+        request.validate()?;
+        let engine = self.state.search_engine().map_err(to_mcp_error)?;
+        let results = engine
+            .symbols(
+                &request.query,
+                request.file_prefix.as_deref(),
+                request.kind.as_deref(),
+                MCP_SYMBOL_LIMIT,
+            )
+            .map_err(to_mcp_error)?;
+        json_content(results)
+    }
+
+    #[tool(
+        description = "Read-only capped expansion after search or symbols. Returns compact coupled handles and anchors from Loom; pass file to disambiguate duplicate names, then inspect selected handles.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub fn related(
@@ -536,30 +704,16 @@ fn to_mcp_error(source: loom_core::LoomError) -> ErrorData {
     }
 }
 
-const fn default_limit() -> usize {
-    10
-}
-
 const fn default_inspect_lines() -> usize {
     24
 }
 
 const fn default_inspect_chars() -> usize {
-    4_000
+    2_000
 }
 
 const fn default_evidence_budget_tokens() -> usize {
     1_200
-}
-
-fn validate_limit(limit: usize) -> Result<(), ErrorData> {
-    if limit == 0 || limit > MAX_LIMIT {
-        return Err(ErrorData::invalid_params(
-            format!("limit must be between 1 and {MAX_LIMIT}"),
-            None,
-        ));
-    }
-    Ok(())
 }
 
 fn validate_range(name: &str, value: usize, min: usize, max: usize) -> Result<(), ErrorData> {
@@ -628,6 +782,8 @@ auto_watch = false
         assert!(!status.embedder_degraded);
         assert_eq!(status.embedder_model, None);
         assert_eq!(status.embedder_dimensions, Some(768));
+        assert_eq!(status.health.status, "healthy");
+        assert!(status.health.warnings.is_empty());
         assert!(!status.watcher_active);
         assert!(!status.auto_watch);
     }
@@ -651,6 +807,7 @@ auto_watch = false
             "related",
             "search",
             "status",
+            "symbols",
         ] {
             assert!(names.contains(expected));
         }
@@ -667,6 +824,7 @@ auto_watch = false
             "search",
             &["first step", "exact_hits", "inspect only chosen handles"],
         );
+        assert_description_contains(&tools, "symbols", &["exact symbol", "same-name"]);
         assert_description_contains(&tools, "related", &["after search", "pass file"]);
         assert_description_contains(&tools, "impact", &["before editing", "not runtime tracing"]);
         assert_description_contains(
@@ -684,6 +842,7 @@ auto_watch = false
         assert_description_contains(&tools, "status", &["Read-only index health check"]);
 
         assert_read_only(&tools, "search", true);
+        assert_read_only(&tools, "symbols", true);
         assert_read_only(&tools, "related", true);
         assert_read_only(&tools, "impact", true);
         assert_read_only(&tools, "neighborhood", true);
@@ -702,12 +861,16 @@ auto_watch = false
 
         assert_property_description_contains(&tools, "search", "query", "before grep");
         assert_property_description_contains(&tools, "search", "kind", "function");
+        assert_property_absent(&tools, "search", "limit");
+        assert_property_description_contains(&tools, "symbols", "file_prefix", "file prefix");
+        assert_property_description_contains(&tools, "symbols", "query", "same-name");
+        assert_property_absent(&tools, "symbols", "limit");
         assert_property_description_contains(&tools, "related", "file", "disambiguate");
         assert_property_description_contains(&tools, "neighborhood", "line", "One-based");
         assert_property_description_contains(&tools, "inspect", "handle", "selected handles");
         assert_property_description_contains(&tools, "inspect", "line_budget", "pagination");
         assert_property_description_contains(&tools, "inspect", "line_offset", "pagination");
-        assert_property_description_contains(&tools, "evidence_pack", "budget_tokens", "8000");
+        assert_property_description_contains(&tools, "evidence_pack", "budget_tokens", "3000");
     }
 
     #[test]
@@ -837,6 +1000,22 @@ auto_watch = false
         assert!(
             description.contains(needle),
             "{tool_name}.{property_name} description should contain {needle:?}: {description}"
+        );
+    }
+
+    fn assert_property_absent(
+        tools: &BTreeMap<String, Tool>,
+        tool_name: &str,
+        property_name: &str,
+    ) {
+        let properties = tools[tool_name]
+            .input_schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .unwrap();
+        assert!(
+            !properties.contains_key(property_name),
+            "{tool_name} should not expose model-chosen {property_name}"
         );
     }
 }

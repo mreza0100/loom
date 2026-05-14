@@ -1,6 +1,8 @@
 use loom_core::{
-    embedder::Embedder, indexer::IndexPipeline, store::LoomDb, LoomConfig, LoomError, Result,
-    VectorBackendConfig,
+    embedder::Embedder,
+    indexer::{index_fingerprint, IndexPipeline},
+    store::LoomDb,
+    LoomConfig, LoomError, Result, VectorBackendConfig,
 };
 use std::fs;
 use std::sync::Arc;
@@ -78,6 +80,36 @@ fn full_index_removes_stale_deleted_files() {
 }
 
 #[test]
+fn stats_report_actual_unindexed_and_changed_files_as_stale() {
+    let dir = tempdir().unwrap();
+    let file = dir.path().join("app.ts");
+    fs::write(&file, "function alpha() {\n  return 1;\n}\n").unwrap();
+    let mut config = LoomConfig::default_for_target(dir.path());
+    config.embedding_dimensions = 3;
+    config.enable_git_analysis = false;
+    let db = Arc::new(LoomDb::open(config.clone()).unwrap());
+
+    assert_eq!(db.get_stats().unwrap().stale_files, 1);
+
+    let pipeline = IndexPipeline::new(
+        config,
+        Arc::clone(&db),
+        Arc::new(MockEmbedder { dimensions: 3 }),
+    );
+    pipeline.full_index().unwrap();
+    assert_eq!(db.get_stats().unwrap().stale_files, 0);
+
+    fs::write(&file, "function alpha() {\n  return 2;\n}\n").unwrap();
+    assert_eq!(db.get_stats().unwrap().stale_files, 1);
+
+    pipeline.full_index().unwrap();
+    assert_eq!(db.get_stats().unwrap().stale_files, 0);
+
+    fs::remove_file(&file).unwrap();
+    assert_eq!(db.get_stats().unwrap().stale_files, 1);
+}
+
+#[test]
 fn full_index_handles_more_files_than_old_parser_channel_bound() {
     let dir = tempdir().unwrap();
     for index in 0..80 {
@@ -134,7 +166,7 @@ fn full_index_rebuilds_vectors_when_backend_changes() {
     assert_eq!(rebuilt.skipped, 0);
     assert_eq!(sqlite_db.get_stats().unwrap().vectors, 1);
     assert!(sqlite_db
-        .file_index_is_fresh("app.ts", &walk_hash(&file), &mock_fingerprint(3))
+        .file_index_is_fresh("app.ts", &walk_hash(&file), &mock_index_fingerprint(3))
         .unwrap());
 }
 
@@ -155,7 +187,7 @@ fn full_index_rebuilds_vectors_when_embedding_fingerprint_changes() {
     );
     assert_eq!(first_pipeline.full_index().unwrap().indexed, 1);
     assert!(db
-        .file_index_is_fresh("app.ts", &walk_hash(&file), &mock_fingerprint(3))
+        .file_index_is_fresh("app.ts", &walk_hash(&file), &mock_index_fingerprint(3))
         .unwrap());
 
     let mut second_config = LoomConfig::default_for_target(dir.path());
@@ -164,7 +196,7 @@ fn full_index_rebuilds_vectors_when_embedding_fingerprint_changes() {
     second_config.vector_backend = VectorBackendConfig::Blob;
     let reopened = Arc::new(LoomDb::open(second_config.clone()).unwrap());
     assert!(!reopened
-        .file_index_is_fresh("app.ts", &walk_hash(&file), &mock_fingerprint(4))
+        .file_index_is_fresh("app.ts", &walk_hash(&file), &mock_index_fingerprint(4))
         .unwrap());
     let second_pipeline = IndexPipeline::new(
         second_config,
@@ -178,7 +210,7 @@ fn full_index_rebuilds_vectors_when_embedding_fingerprint_changes() {
     assert_eq!(rebuilt.skipped, 0);
     assert_eq!(reopened.get_stats().unwrap().vectors, 1);
     assert!(reopened
-        .file_index_is_fresh("app.ts", &walk_hash(&file), &mock_fingerprint(4))
+        .file_index_is_fresh("app.ts", &walk_hash(&file), &mock_index_fingerprint(4))
         .unwrap());
 }
 
@@ -213,6 +245,10 @@ fn walk_hash(path: &std::path::Path) -> String {
 
 fn mock_fingerprint(dimensions: usize) -> String {
     MockEmbedder { dimensions }.fingerprint()
+}
+
+fn mock_index_fingerprint(dimensions: usize) -> String {
+    index_fingerprint(&mock_fingerprint(dimensions))
 }
 
 #[test]

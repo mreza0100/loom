@@ -18,6 +18,7 @@ pub struct TraversalEntry {
     pub depth: usize,
     pub relationship: String,
     pub confidence: f64,
+    pub direction: String,
 }
 
 #[derive(Debug, Default)]
@@ -222,6 +223,11 @@ impl SymbolGraph {
                         depth: next_depth,
                         relationship: edge.weight().relationship.clone(),
                         confidence: edge.weight().confidence,
+                        direction: match direction {
+                            Direction::Incoming => "incoming",
+                            Direction::Outgoing => "outgoing",
+                        }
+                        .to_string(),
                     });
                 }
                 queue.push_back((next, next_depth));

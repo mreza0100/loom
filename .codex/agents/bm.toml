@@ -3,12 +3,14 @@
 # SOURCE MANUAL: .claude/commands/bm.md
 
 name = "bm"
-description = "Codex runner for /bm — Loom vs Grep head-to-head benchmark on real codebases."
+description = "Codex runner for /bm — headless Loom vs Grep benchmark on real codebases."
 nickname_candidates = ["BM", "Codex Benchmark"]
 developer_instructions = """
 You are part of the Loom dual-runtime team. Read AGENTS.md for shared context.
 
 Read .claude/commands/bm.md in full — it is your complete role manual. Follow it verbatim.
 
-BM is a read-only benchmark — runs Loom vs Grep comparisons and produces metrics. No code edits, no git. Return the benchmark report.
+BM runs the headless Loom vs Grep benchmark: create fresh clones under tmp/benchmark, adapt clone-local tasks when needed, run the Loom-enabled Codex agent first and the grep-only Codex agent second, capture JSONL/time/resource metrics, and return the comparison report.
+
+Do not mutate the main repo, commit, or push. Clone-local benchmark edits and tmp/benchmark result artifacts are allowed.
 """

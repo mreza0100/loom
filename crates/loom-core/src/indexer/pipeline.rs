@@ -3,7 +3,7 @@ use crate::{
     error::{LoomError, Result},
     git_analyzer::{GitAnalyzer, SystemCommandRunner},
     indexer::{path, resolver::EdgeResolver, walk},
-    models::{AliasRecord, BehaviorFact, Callsite, Edge, FileRoleCard},
+    models::{AliasRecord, BehaviorFact, Callsite, Edge, FileRoleCard, StoreStats},
     parsers::{parse_file, AdapterRegistry, ParseResult},
     store::{FileIndexReplacement, LoomDb},
     LoomConfig,
@@ -16,6 +16,8 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{error, info, warn};
+
+pub const INDEXER_FINGERPRINT: &str = "indexer=rust-parser-owner-rnd3c";
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
 pub struct IndexResult {
@@ -32,6 +34,26 @@ pub struct IndexResult {
     pub resolved: usize,
     pub cochange_pairs: usize,
     pub errors: usize,
+    pub total_files: i64,
+    pub total_symbols: i64,
+    pub total_edges: i64,
+    pub total_vectors: i64,
+    pub stale_files: i64,
+}
+
+impl IndexResult {
+    fn record_totals(&mut self, stats: &StoreStats) {
+        self.total_files = stats.files;
+        self.total_symbols = stats.symbols;
+        self.total_edges = stats.edges;
+        self.total_vectors = stats.vectors;
+        self.stale_files = stats.stale_files;
+    }
+}
+
+#[must_use]
+pub fn index_fingerprint(embedder_fingerprint: &str) -> String {
+    format!("{embedder_fingerprint};{INDEXER_FINGERPRINT}")
 }
 
 #[derive(Debug)]
@@ -98,6 +120,7 @@ impl<E: Embedder> IndexPipeline<E> {
                 result.cochange_pairs = cochanges.len();
             }
         }
+        result.record_totals(&self.db.get_stats()?);
         Ok(result)
     }
 
@@ -131,13 +154,14 @@ impl<E: Embedder> IndexPipeline<E> {
         result.embeddings += indexed.embeddings;
         result.errors += indexed.errors;
         result.resolved = self.resolve_index_signals()?;
+        result.record_totals(&self.db.get_stats()?);
         Ok(result)
     }
 
     fn index_paths(&self, files: Vec<PathBuf>) -> Result<IndexResult> {
         let mut result = IndexResult::default();
         let mut jobs = Vec::new();
-        let embedding_fingerprint = self.embedder.fingerprint();
+        let embedding_fingerprint = index_fingerprint(&self.embedder.fingerprint());
         for file in files {
             let db_path = path::db_path_for(&file, &self.config)?;
             let content_hash = walk::hash_file(&file)?;
@@ -249,7 +273,7 @@ impl<E: Embedder> IndexPipeline<E> {
         let fact_count = behavior_facts.len();
         let callsite_count = callsites.len();
         let alias_count = aliases.len();
-        let embedding_fingerprint = self.embedder.fingerprint();
+        let embedding_fingerprint = index_fingerprint(&self.embedder.fingerprint());
         let replacement = FileIndexReplacement {
             path: &parsed_file.db_path,
             content_hash: &parsed_file.content_hash,
