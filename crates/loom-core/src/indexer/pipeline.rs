@@ -18,6 +18,8 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 pub const INDEXER_FINGERPRINT: &str = "indexer=rust-parser-owner-rnd3c";
+const MAX_INDEX_BATCH_FILES: usize = 32;
+const MAX_EMBED_TEXT_BATCH: usize = 32;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
 pub struct IndexResult {
@@ -178,35 +180,40 @@ impl<E: Embedder> IndexPipeline<E> {
             return Ok(result);
         }
 
-        let mut parsed_files = Vec::new();
-        for parsed in jobs
-            .into_par_iter()
-            .map(|(absolute_path, db_path, content_hash)| {
-                parse_one_file(absolute_path, db_path, content_hash)
-            })
-            .collect::<Vec<_>>()
-        {
-            match parsed {
-                Ok(parsed_file) => parsed_files.push(parsed_file),
-                Err(source) => {
-                    result.errors += 1;
-                    error!(error = %source, "failed to parse file during index");
+        for job_batch in jobs.chunks(MAX_INDEX_BATCH_FILES) {
+            let mut parsed_files = Vec::new();
+            for parsed in job_batch
+                .par_iter()
+                .map(|(absolute_path, db_path, content_hash)| {
+                    parse_one_file(absolute_path.clone(), db_path.clone(), content_hash.clone())
+                })
+                .collect::<Vec<_>>()
+            {
+                match parsed {
+                    Ok(parsed_file) => parsed_files.push(parsed_file),
+                    Err(source) => {
+                        result.errors += 1;
+                        error!(error = %source, "failed to parse file during index");
+                    }
                 }
             }
-        }
+            if parsed_files.is_empty() {
+                continue;
+            }
 
-        let embedded_files = self.embed_parsed_files(&parsed_files)?;
-        result.embeddings = embedded_files.iter().map(Vec::len).sum();
-        for (parsed_file, embeddings) in parsed_files.into_iter().zip(embedded_files) {
-            let (symbol_count, edge_count, fact_count, callsite_count, alias_count) =
-                self.write_parsed_file(parsed_file, embeddings)?;
-            result.indexed += 1;
-            result.symbols += symbol_count;
-            result.edges += edge_count;
-            result.behavior_facts += fact_count;
-            result.callsites += callsite_count;
-            result.aliases += alias_count;
-            result.role_cards += 1;
+            let embedded_files = self.embed_parsed_files(&parsed_files)?;
+            result.embeddings += embedded_files.iter().map(Vec::len).sum::<usize>();
+            for (parsed_file, embeddings) in parsed_files.into_iter().zip(embedded_files) {
+                let (symbol_count, edge_count, fact_count, callsite_count, alias_count) =
+                    self.write_parsed_file(parsed_file, embeddings)?;
+                result.indexed += 1;
+                result.symbols += symbol_count;
+                result.edges += edge_count;
+                result.behavior_facts += fact_count;
+                result.callsites += callsite_count;
+                result.aliases += alias_count;
+                result.role_cards += 1;
+            }
         }
         info!(
             indexed = result.indexed,
@@ -223,8 +230,10 @@ impl<E: Embedder> IndexPipeline<E> {
         let edge_resolutions = EdgeResolver::new(&self.db).resolve_all()?;
         let _enclosed = self.db.resolve_signal_enclosures()?;
         let callsite_resolutions = self.db.resolve_callsites_from_edges()?;
+        let fuzzy_call_edges = self.db.resolve_callsites_by_symbol_name()?;
+        let fuzzy_callsite_resolutions = self.db.resolve_callsites_from_edges()?;
         self.db.refresh_role_cards()?;
-        Ok(edge_resolutions + callsite_resolutions)
+        Ok(edge_resolutions + callsite_resolutions + fuzzy_call_edges + fuzzy_callsite_resolutions)
     }
 
     fn remove_stale_files(&self, discovered: &BTreeSet<String>) -> Result<IndexResult> {
@@ -358,7 +367,7 @@ impl<E: Embedder> IndexPipeline<E> {
         }
 
         let mut embeddings = Vec::with_capacity(texts.len());
-        for chunk in texts.chunks(128) {
+        for chunk in texts.chunks(MAX_EMBED_TEXT_BATCH) {
             let chunk_texts = chunk.to_vec();
             let chunk_embeddings = self.embedder.embed(&chunk_texts)?;
             if chunk_embeddings.len() != chunk.len() {

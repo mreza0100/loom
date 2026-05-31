@@ -1,10 +1,10 @@
 use loom_core::{
-    embedder::DefaultEmbedder,
+    embedder::{DefaultEmbedder, Embedder},
     graph::SymbolGraph,
     indexer::IndexPipeline,
     models::{
         EvidencePackResponse, ImpactResponse, InspectResponse, NeighborhoodResponse,
-        RelatedResponse, SearchResponse, StoreStats, SymbolListResponse,
+        RelatedResponse, SearchResponse, StoreStats, SymbolHit, SymbolListResponse,
     },
     store::LoomDb,
     watcher::{FnChangeHandler, LoomWatcher},
@@ -18,6 +18,7 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use tracing::{error, warn};
 
@@ -28,85 +29,127 @@ const MAX_HANDLE_BYTES: usize = 4_096;
 const MAX_INSPECT_LINES: usize = 120;
 const MAX_INSPECT_CHARS: usize = 16_000;
 const MAX_INSPECT_LINE_OFFSET: usize = 1_000_000;
-const MAX_EVIDENCE_BUDGET_TOKENS: usize = 8_000;
+const MAX_BATCH_QUERIES: usize = 32;
+const MAX_EVIDENCE_BUDGET_TOKENS: usize = 16_000;
+const MAX_SEARCH_BUDGET_TOKENS: usize = 8_000;
 const MCP_SEARCH_LIMIT: usize = 100;
-const MCP_SYMBOL_LIMIT: usize = 256;
+const MCP_SYMBOL_LIMIT: usize = 48;
+
+#[derive(Debug)]
+struct SymbolOnlyEmbedder {
+    dimensions: usize,
+}
+
+impl Embedder for SymbolOnlyEmbedder {
+    fn embed(&self, _texts: &[String]) -> loom_core::Result<Vec<Vec<f32>>> {
+        Err(loom_core::LoomError::InvalidInput(
+            "symbol-only embedder cannot run semantic search".to_string(),
+        ))
+    }
+
+    fn dimensions(&self) -> usize {
+        self.dimensions
+    }
+}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SearchRequest {
     #[schemars(
-        description = "Natural language or code terms. Use Loom search before grep when you do not know the exact file or symbol; use symbols instead for exact same-name enumeration."
+        description = "Code search query for exact repo file:line answers. Call loom.search before shell grep/find/cat."
     )]
     pub query: String,
     #[schemars(
-        description = "Optional exact symbol kind filter, such as function, class, method, variable, interface, or struct."
+        description = "Optional exact kind filter: function, class, method, variable, interface, struct."
     )]
     pub kind: Option<String>,
+    #[schemars(
+        description = "Search mode: auto, callers, callees, impact, definitions, implementations. Use definitions for type/method locations, impact for blast radius."
+    )]
+    pub mode: Option<String>,
+    #[schemars(description = "Search response token budget, default 2000 and capped at 8000.")]
+    #[serde(default = "default_search_budget_tokens")]
+    pub budget_tokens: usize,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct BatchSearchItem {
+    #[schemars(
+        description = "One concrete code query, such as type Storage interface or DB.Close."
+    )]
+    pub query: String,
+    #[schemars(
+        description = "Optional exact kind filter: function, class, method, variable, interface, struct."
+    )]
+    pub kind: Option<String>,
+    #[schemars(
+        description = "Search mode for this query: auto, callers, callees, impact, definitions, implementations."
+    )]
+    pub mode: Option<String>,
+    #[schemars(description = "Per-query token budget, default 900 and capped at 8000.")]
+    #[serde(default = "default_batch_search_budget_tokens")]
+    pub budget_tokens: usize,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum BatchSearchEntry {
+    Text(String),
+    Item(BatchSearchItem),
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct BatchSearchRequest {
+    #[schemars(
+        description = "Batch of concrete code queries. Strings are accepted; objects can set query/kind/mode/budget_tokens."
+    )]
+    pub queries: Vec<BatchSearchEntry>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SymbolListRequest {
     #[schemars(
-        description = "Exact symbol or method suffix to enumerate, such as execute or Engine.resolveDescriptor. Use this before grep for same-name symbols."
+        description = "Exact symbol/name suffix to enumerate after search, especially duplicate same-name methods."
     )]
     pub query: String,
-    #[schemars(
-        description = "Optional repo-relative file prefix, such as sources/commands, to bound enumeration."
-    )]
+    #[schemars(description = "Optional repo-relative file prefix, such as sources/commands.")]
     pub file_prefix: Option<String>,
     #[schemars(
-        description = "Optional exact symbol kind filter, such as function, class, method, variable, interface, or struct."
+        description = "Optional exact kind filter: function, class, method, variable, interface, struct."
     )]
     pub kind: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SymbolRequest {
-    #[schemars(
-        description = "Symbol name to inspect. Prefer a name returned by Loom search or neighborhood."
-    )]
+    #[schemars(description = "Symbol name returned by search, symbols, or neighborhood.")]
     pub symbol: String,
-    #[schemars(
-        description = "Optional repo-relative indexed file path used to disambiguate duplicate symbol names."
-    )]
+    #[schemars(description = "Optional repo-relative path to disambiguate duplicate names.")]
     pub file: Option<String>,
     #[schemars(
-        description = "Optional exact symbol kind filter, such as function, class, method, variable, interface, or struct."
+        description = "Optional exact kind filter: function, class, method, variable, interface, struct."
     )]
     pub kind: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct NeighborhoodRequest {
-    #[schemars(
-        description = "Repo-relative indexed file path. Use this when you already have a file and line."
-    )]
+    #[schemars(description = "Repo-relative indexed file path.")]
     pub file: String,
-    #[schemars(
-        description = "One-based line number. Loom anchors to the symbol covering this line, or the nearest symbol."
-    )]
+    #[schemars(description = "One-based line number; anchors to covering or nearest symbol.")]
     pub line: i64,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct InspectRequest {
-    #[schemars(
-        description = "Handle from search, related, impact, neighborhood, or evidence_pack. Use inspect only for selected handles."
-    )]
+    #[schemars(description = "Handle from a Loom result. Inspect only selected handles.")]
     pub handle: String,
-    #[schemars(
-        description = "Preferred source line budget is 1 to 32. Larger accepted values are capped by Loom; use pagination via line_offset instead of broad file reads."
-    )]
+    #[schemars(description = "Source line budget, capped; use line_offset for pagination.")]
     #[serde(default = "default_inspect_lines")]
     pub line_budget: usize,
-    #[schemars(
-        description = "Preferred source character budget is 1 to 2000. Larger accepted values are capped by Loom; smaller budgets keep MCP answers compact."
-    )]
+    #[schemars(description = "Source character budget, capped.")]
     #[serde(default = "default_inspect_chars")]
     pub char_budget: usize,
-    #[schemars(
-        description = "Zero-based line offset within the symbol or file handle for pagination."
-    )]
+    #[schemars(description = "Zero-based pagination offset.")]
     #[serde(default)]
     pub line_offset: usize,
 }
@@ -114,12 +157,10 @@ pub struct InspectRequest {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct EvidencePackRequest {
     #[schemars(
-        description = "Question or code concept to prove. Run before a final answer when citations are needed."
+        description = "full user question for one-shot evidence_pack. Include all sub-questions; do not split into search/inspect follow-ups."
     )]
     pub query: String,
-    #[schemars(
-        description = "Preferred token budget for the evidence bundle is 1 to 3000. Larger accepted values are capped by Loom."
-    )]
+    #[schemars(description = "Evidence token budget, default 8000 and capped at 16000.")]
     #[serde(default = "default_evidence_budget_tokens")]
     pub budget_tokens: usize,
 }
@@ -157,6 +198,8 @@ struct CoreState {
     db: Arc<LoomDb>,
     graph: Mutex<Arc<SymbolGraph>>,
     embedder: Mutex<Option<Arc<DefaultEmbedder>>>,
+    index_ready: AtomicBool,
+    background_index_started: AtomicBool,
     reindex_lock: Mutex<()>,
     watcher: Mutex<Option<LoomWatcher>>,
 }
@@ -199,12 +242,7 @@ impl LoomServerState {
 
     pub fn reindex(&self) -> loom_core::Result<IndexResult> {
         let core = self.core()?;
-        let _guard = core.lock_reindex();
-        let embedder = core.embedder()?;
-        let pipeline = IndexPipeline::new(core.config.clone(), Arc::clone(&core.db), embedder);
-        let result = pipeline.full_index()?;
-        core.refresh_graph()?;
-        Ok(result)
+        core.full_index_and_refresh()
     }
 
     pub fn search(
@@ -223,8 +261,16 @@ impl LoomServerState {
         kind: Option<&str>,
         limit: usize,
     ) -> loom_core::Result<SymbolListResponse> {
-        self.search_engine()?
-            .symbols(query, file_prefix, kind, limit)
+        let core = self.core()?;
+        let engine = SearchEngine::new(
+            Arc::clone(&core.db),
+            Arc::new(SymbolOnlyEmbedder {
+                dimensions: core.config.embedding_dimensions,
+            }),
+            None,
+            core.config.clone(),
+        );
+        engine.symbols(query, file_prefix, kind, limit)
     }
 
     pub fn related(
@@ -276,7 +322,8 @@ impl LoomServerState {
             core.embedder()?,
             Some(graph),
             core.config.clone(),
-        ))
+        )
+        .with_index_ready(core.index_ready.load(Ordering::Acquire)))
     }
 
     fn core(&self) -> loom_core::Result<Arc<CoreState>> {
@@ -290,11 +337,14 @@ impl LoomServerState {
         let config = LoomConfig::load(self.target_dir.clone())?;
         let db = Arc::new(LoomDb::open(config.clone())?);
         let graph = Arc::new(SymbolGraph::build_from_db(&db)?);
+        let stats = db.get_stats()?;
         let core = Arc::new(CoreState {
             config,
             db,
             graph: Mutex::new(graph),
             embedder: Mutex::new(None),
+            index_ready: AtomicBool::new(stats.stale_files == 0 && stats.files > 0),
+            background_index_started: AtomicBool::new(false),
             reindex_lock: Mutex::new(()),
             watcher: Mutex::new(None),
         });
@@ -303,6 +353,12 @@ impl LoomServerState {
         }
         *guard = Some(Arc::clone(&core));
         Ok(core)
+    }
+
+    fn start_background_indexing(&self) -> loom_core::Result<()> {
+        let core = self.core()?;
+        core.start_background_indexing();
+        Ok(())
     }
 }
 
@@ -353,6 +409,41 @@ fn index_health(
 }
 
 impl CoreState {
+    fn start_background_indexing(self: &Arc<Self>) {
+        if self.index_ready.load(Ordering::Acquire)
+            || self.background_index_started.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let core = Arc::clone(self);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn_blocking(move || core.run_background_index());
+        } else {
+            std::thread::spawn(move || core.run_background_index());
+        }
+    }
+
+    fn run_background_index(self: Arc<Self>) {
+        match self.full_index_and_refresh() {
+            Ok(_) => self.index_ready.store(true, Ordering::Release),
+            Err(source) => {
+                self.background_index_started
+                    .store(false, Ordering::Release);
+                warn!(error = %source, "background index failed");
+            }
+        }
+    }
+
+    fn full_index_and_refresh(&self) -> loom_core::Result<IndexResult> {
+        let _guard = self.lock_reindex();
+        let embedder = self.embedder()?;
+        let pipeline = IndexPipeline::new(self.config.clone(), Arc::clone(&self.db), embedder);
+        let result = pipeline.full_index()?;
+        self.refresh_graph()?;
+        self.index_ready.store(true, Ordering::Release);
+        Ok(result)
+    }
+
     fn start_watcher_once(self: &Arc<Self>) -> loom_core::Result<()> {
         let mut guard = self.lock_watcher();
         if guard.is_some() {
@@ -462,7 +553,75 @@ impl CoreState {
 impl SearchRequest {
     fn validate(&self) -> Result<(), ErrorData> {
         validate_nonempty("query", &self.query, MAX_QUERY_BYTES)?;
-        validate_optional("kind", self.kind.as_deref(), MAX_SYMBOL_BYTES)
+        validate_optional("kind", self.kind.as_deref(), MAX_SYMBOL_BYTES)?;
+        validate_optional("mode", self.mode.as_deref(), MAX_SYMBOL_BYTES)?;
+        validate_range(
+            "budget_tokens",
+            self.budget_tokens,
+            1,
+            MAX_SEARCH_BUDGET_TOKENS,
+        )
+    }
+}
+
+impl BatchSearchItem {
+    fn validate(&self) -> Result<(), ErrorData> {
+        validate_nonempty("query", &self.query, MAX_QUERY_BYTES)?;
+        validate_optional("kind", self.kind.as_deref(), MAX_SYMBOL_BYTES)?;
+        validate_optional("mode", self.mode.as_deref(), MAX_SYMBOL_BYTES)?;
+        validate_range(
+            "budget_tokens",
+            self.budget_tokens,
+            1,
+            MAX_SEARCH_BUDGET_TOKENS,
+        )
+    }
+}
+
+impl BatchSearchEntry {
+    fn validate(&self) -> Result<(), ErrorData> {
+        match self {
+            BatchSearchEntry::Text(query) => validate_nonempty("query", query, MAX_QUERY_BYTES),
+            BatchSearchEntry::Item(item) => item.validate(),
+        }
+    }
+
+    fn query(&self) -> String {
+        match self {
+            BatchSearchEntry::Text(query) => query.clone(),
+            BatchSearchEntry::Item(item) => item.query.clone(),
+        }
+    }
+
+    fn kind(&self) -> Option<&str> {
+        match self {
+            BatchSearchEntry::Text(query) => infer_batch_kind(query),
+            BatchSearchEntry::Item(item) => item.kind.as_deref(),
+        }
+    }
+
+    fn mode(&self) -> Option<&str> {
+        match self {
+            BatchSearchEntry::Text(query) => infer_batch_mode(query),
+            BatchSearchEntry::Item(item) => item.mode.as_deref(),
+        }
+    }
+
+    fn budget_tokens(&self) -> usize {
+        match self {
+            BatchSearchEntry::Text(_) => default_batch_search_budget_tokens(),
+            BatchSearchEntry::Item(item) => item.budget_tokens,
+        }
+    }
+}
+
+impl BatchSearchRequest {
+    fn validate(&self) -> Result<(), ErrorData> {
+        validate_range("queries", self.queries.len(), 1, MAX_BATCH_QUERIES)?;
+        for query in &self.queries {
+            query.validate()?;
+        }
+        Ok(())
     }
 }
 
@@ -523,12 +682,16 @@ impl LoomMcpServer {
             tool_router: Self::tool_router(),
         })
     }
+
+    pub fn start_lazy_indexing(&self) -> loom_core::Result<()> {
+        self.state.start_background_indexing()
+    }
 }
 
 #[tool_router]
 impl LoomMcpServer {
     #[tool(
-        description = "Read-only first step for conceptual code discovery. The model does not choose a result limit; Loom returns the complete internally bounded exact_hits and beyond_grep set with handles, anchors, summaries, reasons, and budget metadata. Use symbols for exact enumeration, evidence_pack for broad proof, and inspect only chosen handles next.",
+        description = "Single focused query for targeted follow-up only. Prefer evidence_pack for initial exploration.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub fn search(
@@ -538,13 +701,60 @@ impl LoomMcpServer {
         request.validate()?;
         let engine = self.state.search_engine().map_err(to_mcp_error)?;
         let results = engine
-            .search(&request.query, MCP_SEARCH_LIMIT, request.kind.as_deref())
+            .search_mode_with_budget(
+                &request.query,
+                MCP_SEARCH_LIMIT,
+                request.kind.as_deref(),
+                request.mode.as_deref(),
+                request.budget_tokens,
+            )
             .map_err(to_mcp_error)?;
-        json_content(results)
+        Ok(Content::text(render_mcp_search(&results, true)))
     }
 
     #[tool(
-        description = "Read-only exact symbol enumerator. The model does not choose a result limit; Loom returns every internally bounded matching symbol. Use before grep for same-name methods or known symbols, for example query=execute file_prefix=sources/commands kind=method; returns compact handles for selective inspect.",
+        description = "Use only after loom.evidence_pack when you already know several narrow subqueries. Do not use this as the first tool for full task prompts. Results are verified citable file:line evidence from the local index. Do not run shell rg/cat/nl/sed to verify returned hits.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    pub fn batch_search(
+        &self,
+        Parameters(request): Parameters<BatchSearchRequest>,
+    ) -> Result<Content, ErrorData> {
+        request.validate()?;
+        let engine = self.state.search_engine().map_err(to_mcp_error)?;
+        let mut rendered = format!(
+            "loom.batch_search queries={}\nNO_SHELL_VERIFICATION: returned hits are verified local file:line evidence. Do not rg/cat/nl/sed to re-check them; use loom.inspect only for body text.",
+            request.queries.len()
+        );
+        for (index, entry) in request.queries.iter().enumerate() {
+            let query = entry.query();
+            rendered.push_str(&format!(
+                "\n\n## q{} query={} mode={} kind={}",
+                index + 1,
+                query,
+                entry.mode().unwrap_or("auto"),
+                entry.kind().unwrap_or("any")
+            ));
+            rendered.push('\n');
+            let response = engine
+                .search_mode_with_budget(
+                    &query,
+                    MCP_SEARCH_LIMIT,
+                    entry.kind(),
+                    entry.mode(),
+                    entry.budget_tokens(),
+                )
+                .map_err(to_mcp_error)?;
+            rendered.push_str(&render_mcp_search(&response, false));
+        }
+        rendered.push_str(
+            "\n\nBATCH_COMPLETE: answer from the relevant file:line hits above. Do not run shell follow-up. If a body is needed, call loom.inspect on the handle instead of rg/cat/nl/sed.",
+        );
+        Ok(Content::text(rendered))
+    }
+
+    #[tool(
+        description = "Use after loom.search to enumerate exact citable symbols when names are duplicated. Read-only/local-only. Prefer this over rg for same-name methods, interfaces, structs, and file-prefix narrowing. Do not inspect every result.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub fn symbols(
@@ -552,8 +762,8 @@ impl LoomMcpServer {
         Parameters(request): Parameters<SymbolListRequest>,
     ) -> Result<Content, ErrorData> {
         request.validate()?;
-        let engine = self.state.search_engine().map_err(to_mcp_error)?;
-        let results = engine
+        let results = self
+            .state
             .symbols(
                 &request.query,
                 request.file_prefix.as_deref(),
@@ -561,11 +771,11 @@ impl LoomMcpServer {
                 MCP_SYMBOL_LIMIT,
             )
             .map_err(to_mcp_error)?;
-        json_content(results)
+        Ok(Content::text(render_mcp_symbols(&results)))
     }
 
     #[tool(
-        description = "Read-only capped expansion after search or symbols. Returns compact coupled handles and anchors from Loom; pass file to disambiguate duplicate names, then inspect selected handles.",
+        description = "Read-only/local-only graph expansion after loom.search. Use instead of shell follow-up when you need neighboring callers, callees, implemented interfaces, or related definitions. Pass file to disambiguate duplicate names.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub fn related(
@@ -585,7 +795,7 @@ impl LoomMcpServer {
     }
 
     #[tool(
-        description = "Read-only blast-radius check before editing. Returns compact static callers/dependents from Loom; this is not runtime tracing and snippets require inspect.",
+        description = "Read-only/local-only blast-radius check. Use for signature-change impact, callers, implementations, and Commit/Close-style method fanout. Prefer search(mode=\"impact\") first; use this to expand one exact symbol.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub fn impact(
@@ -605,7 +815,7 @@ impl LoomMcpServer {
     }
 
     #[tool(
-        description = "Read-only anchor lookup when you have a file and line. Returns compact nearby/coupled handles so you can avoid broad grep and inspect only selected code.",
+        description = "Read-only/local-only file:line neighborhood. Use after a Loom hit to identify the containing function, method, struct, interface, callers, and adjacent symbols without cat/sed.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub fn neighborhood(
@@ -621,7 +831,7 @@ impl LoomMcpServer {
     }
 
     #[tool(
-        description = "Read-only source inspection. Resolves one Loom handle into a bounded snippet with file/line citations, stale-handle guidance, and pagination metadata.",
+        description = "Read source lines for one handle. Rarely needed - evidence_pack already includes snippets.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub fn inspect(
@@ -638,11 +848,11 @@ impl LoomMcpServer {
                 request.line_offset,
             )
             .map_err(to_mcp_error)?;
-        json_content(results)
+        Ok(Content::text(render_mcp_inspect(&results)))
     }
 
     #[tool(
-        description = "Read-only proof bundle before a final answer. Orchestrates search, beyond-grep evidence, graph neighbors, and inspected snippets within budget; shell is last resort.",
+        description = "One-shot answer engine for code questions. Returns complete source snippets with file:lines. Call ONCE with your full question - do not follow up with search/inspect/symbols/shell.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub fn evidence_pack(
@@ -654,11 +864,11 @@ impl LoomMcpServer {
         let results = engine
             .evidence_pack(&request.query, request.budget_tokens)
             .map_err(to_mcp_error)?;
-        json_content(results)
+        Ok(Content::text(render_mcp_evidence_pack(&results)))
     }
 
     #[tool(
-        description = "Non-read-only index mutation. Updates only the local .loom index after source changes or stale status; run before search when freshness is uncertain.",
+        description = "Non-read-only index mutation. Updates only local .loom after source changes or stale status.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -670,7 +880,7 @@ impl LoomMcpServer {
     }
 
     #[tool(
-        description = "Read-only index health check. Use before relying on Loom; reports freshness, counts, backends, schema, and watcher state.",
+        description = "Read-only/local-only index health check. Call when unsure whether Loom is ready; if healthy/stale_files=0, trust loom.search before shell grep/find/cat.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub fn status(&self) -> Result<Content, ErrorData> {
@@ -688,6 +898,229 @@ impl ServerHandler for LoomMcpServer {
 
 fn json_content(value: impl Serialize) -> Result<Content, ErrorData> {
     Content::json(value)
+}
+
+fn render_mcp_search(response: &SearchResponse, include_continuation: bool) -> String {
+    let total = response.exact_hits.len() + response.beyond_grep.len();
+    let mut output = format!(
+        "loom.search rev={} results={} truncated={} omitted={}",
+        response.index_revision, total, response.truncated, response.budget.omitted
+    );
+    if let Some(status) = &response.index_status {
+        output.push_str(&format!("\nindex_status={status}"));
+    }
+    output.push_str(
+        "\nCITE_DIRECTLY: each hit is local file:line evidence. Do not grep/cat/sed to re-verify. Use loom.inspect only when the answer needs body text.",
+    );
+    append_mcp_hits(&mut output, "exact_hits", &response.exact_hits);
+    append_mcp_hits(&mut output, "beyond_grep", &response.beyond_grep);
+    if include_continuation {
+        if let Some(continuation) = &response.continuation {
+            output.push_str(&format!(
+                "\nmore omitted={} hint={}",
+                continuation.omitted, continuation.next_request_hint
+            ));
+        }
+    }
+    output
+}
+
+fn render_mcp_symbols(response: &SymbolListResponse) -> String {
+    let mut output = format!(
+        "loom.symbols rev={} query={} results={} truncated={}",
+        response.index_revision,
+        response.query,
+        response.results.len(),
+        response.truncated
+    );
+    if let Some(prefix) = &response.file_prefix {
+        output.push_str(&format!(" file_prefix={prefix}"));
+    }
+    if let Some(kind) = &response.kind {
+        output.push_str(&format!(" kind={kind}"));
+    }
+    output.push_str(
+        "\nCITE_DIRECTLY: each result is local file:line evidence. Do not inspect every result.",
+    );
+    append_mcp_hits(&mut output, "results", &response.results);
+    output
+}
+
+fn append_mcp_hits(output: &mut String, label: &str, hits: &[SymbolHit]) {
+    output.push_str(&format!("\n{label}:"));
+    if hits.is_empty() {
+        output.push_str("\n- none");
+        return;
+    }
+    for hit in hits {
+        output.push_str(&format!(
+            "\n- {} {} {}:{}-{} handle={} summary={}",
+            hit.kind,
+            hit.name,
+            hit.anchor.file,
+            hit.anchor.line,
+            hit.anchor.end_line,
+            hit.handle,
+            compact_one_line(&hit.summary)
+        ));
+        if let Some(role) = &hit.graph_role {
+            output.push_str(&format!(" role={role}"));
+        }
+    }
+}
+
+fn render_mcp_inspect(response: &InspectResponse) -> String {
+    if let Some(error) = &response.error {
+        return format!(
+            "loom.inspect rev={} handle={} kind={} stale={} error={}",
+            response.index_revision, response.handle, response.handle_kind, response.stale, error
+        );
+    }
+    let mut output = format!(
+        "loom.inspect rev={} handle={} kind={} stale={} truncated={}",
+        response.index_revision,
+        response.handle,
+        response.handle_kind,
+        response.stale,
+        response.truncated
+    );
+    output.push_str("\nNO_SHELL: snippet below is local disk text; cite these lines directly.");
+    if let Some(snippet) = &response.snippet {
+        output.push_str(&format!(
+            "\n{}:{}-{}\n{}",
+            snippet.anchor.file, snippet.start_line, snippet.end_line, snippet.text
+        ));
+    }
+    if let Some(next) = response.page.next_line_offset {
+        output.push_str(&format!("\nnext: loom.inspect line_offset={next}"));
+    }
+    output
+}
+
+fn render_mcp_evidence_pack(response: &EvidencePackResponse) -> String {
+    let mut output = format!(
+        "loom.evidence_pack budget={} sub_questions={}",
+        response.budget.requested,
+        response.sub_questions.len()
+    );
+    for question in &response.sub_questions {
+        output.push_str(&format!(
+            "\n\n## {}: {}",
+            question.label,
+            compact_one_line(&question.query)
+        ));
+        if !question.symbols.is_empty() {
+            output.push_str(&format!("\nsymbols: {}", question.symbols.join(", ")));
+        }
+    }
+    if !response.exact_hits.is_empty() {
+        output.push_str("\n\nexact_hits:");
+        for hit in &response.exact_hits {
+            output.push_str(&format!(
+                "\n{}:{}-{} | {} | {}",
+                hit.anchor.file, hit.anchor.line, hit.anchor.end_line, hit.kind, hit.name
+            ));
+        }
+    }
+    if !response.beyond_grep.is_empty() {
+        output.push_str("\n\nbeyond_grep:");
+        for hit in &response.beyond_grep {
+            output.push_str(&format!(
+                "\n{}:{}-{} | {} | {}",
+                hit.anchor.file, hit.anchor.line, hit.anchor.end_line, hit.kind, hit.name
+            ));
+        }
+    }
+    if !response.behavior_facts.is_empty() {
+        output.push_str("\n\nfacts:");
+        for hit in &response.behavior_facts {
+            output.push_str(&format!(
+                "\n{}:{} | {} | {}",
+                hit.anchor.file, hit.anchor.line, hit.kind, hit.name
+            ));
+        }
+    }
+    if !response.inspected_snippets.is_empty() {
+        output.push_str("\n\nsnippets:");
+        for snippet in &response.inspected_snippets {
+            append_numbered_snippet(&mut output, snippet);
+        }
+    }
+    if !response.missing_concepts.is_empty() {
+        output.push_str("\n\nmissing:");
+        for concept in &response.missing_concepts {
+            output.push_str(&format!("\n- {concept}"));
+        }
+    }
+    if !response.omitted.is_empty() {
+        let visible_notes = response
+            .omitted
+            .iter()
+            .filter(|note| {
+                !note.starts_with("not_found_symbol")
+                    && *note != "search results were truncated before evidence packing"
+            })
+            .collect::<Vec<_>>();
+        if !visible_notes.is_empty() {
+            output.push_str("\n\nnotes:");
+            for note in visible_notes {
+                output.push_str(&format!("\n- {}", compact_one_line(note)));
+            }
+        }
+    }
+    output.push_str(&format!(
+        "\n\nCOMPLETE: {} questions, {} evidence items. Use the snippets above as sufficient source evidence; do not run follow-up tools, including evidence_pack/shell/rg/cat/sed/nl.",
+        response.sub_questions.len(),
+        response.exact_hits.len()
+            + response.beyond_grep.len()
+            + response.behavior_facts.len()
+            + response.inspected_snippets.len()
+    ));
+    output
+}
+
+fn append_numbered_snippet(output: &mut String, snippet: &loom_core::models::InspectSnippet) {
+    output.push_str(&format!(
+        "\n{}:{}-{}",
+        snippet.anchor.file, snippet.start_line, snippet.end_line
+    ));
+    for (offset, line) in snippet.text.lines().enumerate() {
+        let line_number = snippet.start_line + i64::try_from(offset).unwrap_or(0);
+        output.push_str(&format!("\n  {line_number}: {line}"));
+    }
+}
+
+fn compact_one_line(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn infer_batch_mode(query: &str) -> Option<&'static str> {
+    let lower = query.to_ascii_lowercase();
+    if lower.contains("definition") || lower.contains("defined") {
+        Some("definitions")
+    } else if lower.contains("caller") || lower.contains("call site") || lower.contains("callsite")
+    {
+        Some("callers")
+    } else if lower.contains("impact") || lower.contains("blast") {
+        Some("impact")
+    } else {
+        None
+    }
+}
+
+fn infer_batch_kind(query: &str) -> Option<&'static str> {
+    let lower = query.to_ascii_lowercase();
+    if lower.contains(" interface") {
+        Some("interface")
+    } else if lower.contains(" method") || query.contains('.') {
+        Some("method")
+    } else if lower.contains(" struct") || lower.contains(" type") {
+        Some("class")
+    } else if lower.contains(" function") || lower.starts_with("func ") {
+        Some("function")
+    } else {
+        None
+    }
 }
 
 fn to_mcp_error(source: loom_core::LoomError) -> ErrorData {
@@ -713,7 +1146,15 @@ const fn default_inspect_chars() -> usize {
 }
 
 const fn default_evidence_budget_tokens() -> usize {
-    1_200
+    8_000
+}
+
+const fn default_search_budget_tokens() -> usize {
+    2_000
+}
+
+const fn default_batch_search_budget_tokens() -> usize {
+    900
 }
 
 fn validate_range(name: &str, value: usize, min: usize, max: usize) -> Result<(), ErrorData> {
@@ -799,6 +1240,7 @@ auto_watch = false
             .map(|tool| tool.name.to_string())
             .collect::<std::collections::BTreeSet<_>>();
         for expected in [
+            "batch_search",
             "evidence_pack",
             "impact",
             "inspect",
@@ -822,26 +1264,43 @@ auto_watch = false
         assert_description_contains(
             &tools,
             "search",
-            &["first step", "exact_hits", "inspect only chosen handles"],
+            &["Single focused", "targeted follow-up", "evidence_pack"],
         );
-        assert_description_contains(&tools, "symbols", &["exact symbol", "same-name"]);
-        assert_description_contains(&tools, "related", &["after search", "pass file"]);
-        assert_description_contains(&tools, "impact", &["before editing", "not runtime tracing"]);
         assert_description_contains(
             &tools,
-            "neighborhood",
-            &["file and line", "avoid broad grep"],
+            "batch_search",
+            &[
+                "after loom.evidence_pack",
+                "Do not use this as the first tool",
+            ],
         );
-        assert_description_contains(&tools, "inspect", &["bounded snippet", "stale-handle"]);
+        assert_description_contains(&tools, "symbols", &["after loom.search", "same-name"]);
+        assert_description_contains(
+            &tools,
+            "related",
+            &["after loom.search", "instead of shell follow-up"],
+        );
+        assert_description_contains(
+            &tools,
+            "impact",
+            &["search(mode=\"impact\")", "signature-change impact"],
+        );
+        assert_description_contains(&tools, "neighborhood", &["file:line neighborhood"]);
+        assert_description_contains(&tools, "inspect", &["Read source lines", "evidence_pack"]);
         assert_description_contains(
             &tools,
             "evidence_pack",
-            &["proof bundle", "shell is last resort"],
+            &[
+                "One-shot answer engine",
+                "complete source snippets",
+                "Call ONCE",
+            ],
         );
         assert_description_contains(&tools, "reindex", &["Non-read-only index mutation"]);
-        assert_description_contains(&tools, "status", &["Read-only index health check"]);
+        assert_description_contains(&tools, "status", &["Read-only", "trust loom.search"]);
 
         assert_read_only(&tools, "search", true);
+        assert_read_only(&tools, "batch_search", true);
         assert_read_only(&tools, "symbols", true);
         assert_read_only(&tools, "related", true);
         assert_read_only(&tools, "impact", true);
@@ -859,8 +1318,9 @@ auto_watch = false
             Some(false)
         );
 
-        assert_property_description_contains(&tools, "search", "query", "before grep");
+        assert_property_description_contains(&tools, "search", "query", "before shell");
         assert_property_description_contains(&tools, "search", "kind", "function");
+        assert_property_description_contains(&tools, "search", "mode", "blast radius");
         assert_property_absent(&tools, "search", "limit");
         assert_property_description_contains(&tools, "symbols", "file_prefix", "file prefix");
         assert_property_description_contains(&tools, "symbols", "query", "same-name");
@@ -870,7 +1330,13 @@ auto_watch = false
         assert_property_description_contains(&tools, "inspect", "handle", "selected handles");
         assert_property_description_contains(&tools, "inspect", "line_budget", "pagination");
         assert_property_description_contains(&tools, "inspect", "line_offset", "pagination");
-        assert_property_description_contains(&tools, "evidence_pack", "budget_tokens", "3000");
+        assert_property_description_contains(
+            &tools,
+            "evidence_pack",
+            "query",
+            "full user question",
+        );
+        assert_property_description_contains(&tools, "evidence_pack", "budget_tokens", "16000");
     }
 
     #[test]

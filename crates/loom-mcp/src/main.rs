@@ -78,7 +78,7 @@ enum Command {
     },
     EvidencePack {
         query: String,
-        #[arg(long, default_value_t = 1_200)]
+        #[arg(long, default_value_t = 8_000)]
         budget_tokens: usize,
     },
 }
@@ -200,6 +200,7 @@ async fn main() -> Result<()> {
         }
         Some(Command::Serve) | None => {
             let server = server::LoomMcpServer::new(cli.target)?;
+            server.start_lazy_indexing()?;
             server
                 .serve((tokio::io::stdin(), tokio::io::stdout()))
                 .await?
@@ -247,14 +248,12 @@ fn render_symbols(response: &SymbolListResponse) -> String {
 }
 
 fn render_related(response: &RelatedResponse) -> String {
-    let mut output = render_coupled_response(
+    render_coupled_response(
         "related",
         &response.index_revision,
         response.truncated,
         &response.results,
-    );
-    append_next_suggestions(&mut output, &response.next_tool_suggestions);
-    output
+    )
 }
 
 fn render_impact(response: &ImpactResponse) -> String {
@@ -518,6 +517,7 @@ mod tests {
                 ..Default::default()
             },
             reason_codes: vec!["exact:file_line".to_string()],
+            graph_role: None,
             lexical_evidence: Some(loom_core::models::LexicalEvidence {
                 snippet: "async execute() {".to_string(),
                 matched_text: "execute(".to_string(),
@@ -533,6 +533,7 @@ mod tests {
             contract: "loom.search.response".to_string(),
             version: 1,
             index_revision: "idx".to_string(),
+            index_status: None,
             limit: 10,
             truncated: false,
             inspect_required: true,

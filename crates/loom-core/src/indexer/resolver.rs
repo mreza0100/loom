@@ -8,6 +8,83 @@ use std::collections::{BTreeMap, BTreeSet};
 
 type ImportMap = BTreeMap<(String, String), (String, Option<String>)>;
 
+#[derive(Debug, Default)]
+struct ResolverIndex {
+    symbols_by_id: BTreeMap<i64, Symbol>,
+    exact_by_name: BTreeMap<String, Vec<i64>>,
+    exact_by_file_name: BTreeMap<(String, String), Vec<i64>>,
+    suffix_by_name: BTreeMap<String, Vec<i64>>,
+    suffix_by_file_name: BTreeMap<(String, String), Vec<i64>>,
+}
+
+impl ResolverIndex {
+    fn from_symbols(symbols: Vec<Symbol>) -> Self {
+        let mut index = Self::default();
+        for symbol in symbols {
+            let Some(symbol_id) = symbol.id else {
+                continue;
+            };
+            index
+                .exact_by_name
+                .entry(symbol.name.clone())
+                .or_default()
+                .push(symbol_id);
+            index
+                .exact_by_file_name
+                .entry((symbol.file.clone(), symbol.name.clone()))
+                .or_default()
+                .push(symbol_id);
+            if let Some((_, suffix)) = symbol.name.rsplit_once('.') {
+                index
+                    .suffix_by_name
+                    .entry(suffix.to_string())
+                    .or_default()
+                    .push(symbol_id);
+                index
+                    .suffix_by_file_name
+                    .entry((symbol.file.clone(), suffix.to_string()))
+                    .or_default()
+                    .push(symbol_id);
+            }
+            index.symbols_by_id.insert(symbol_id, symbol);
+        }
+        index
+    }
+
+    fn source_symbol(&self, symbol_id: i64) -> Option<&Symbol> {
+        self.symbols_by_id.get(&symbol_id)
+    }
+
+    fn unique_exact(&self, name: &str, file: Option<&str>) -> Option<i64> {
+        let ids = if let Some(file) = file {
+            self.exact_by_file_name
+                .get(&(file.to_string(), name.to_string()))
+        } else {
+            self.exact_by_name.get(name)
+        }?;
+        unique_id_slice(ids)
+    }
+
+    fn unique_suffix(&self, suffix: &str, file: Option<&str>) -> Option<i64> {
+        let ids = if let Some(file) = file {
+            self.suffix_by_file_name
+                .get(&(file.to_string(), suffix.to_string()))
+        } else {
+            self.suffix_by_name.get(suffix)
+        }?;
+        unique_id_slice(ids)
+    }
+
+    fn exact_symbols(&self, name: &str) -> Vec<&Symbol> {
+        self.exact_by_name
+            .get(name)
+            .into_iter()
+            .flat_map(|ids| ids.iter())
+            .filter_map(|id| self.symbols_by_id.get(id))
+            .collect()
+    }
+}
+
 pub struct EdgeResolver<'a> {
     db: &'a LoomDb,
     registry: AdapterRegistry,
@@ -23,10 +100,13 @@ impl<'a> EdgeResolver<'a> {
 
     pub fn resolve_all(&self) -> Result<usize> {
         let import_map = self.build_import_map()?;
+        let symbol_index = ResolverIndex::from_symbols(self.db.list_all_symbols()?);
         let unresolved = self.db.get_unresolved_edges()?;
         let mut resolutions = Vec::new();
         for edge in unresolved {
-            if let Some((target_id, confidence)) = self.resolve_single_edge(&edge, &import_map)? {
+            if let Some((target_id, confidence)) =
+                self.resolve_single_edge(&edge, &import_map, &symbol_index)?
+            {
                 if let Some(edge_id) = edge.id {
                     resolutions.push((edge_id, target_id, confidence));
                 }
@@ -71,17 +151,16 @@ impl<'a> EdgeResolver<'a> {
         &self,
         edge: &Edge,
         import_map: &ImportMap,
+        symbol_index: &ResolverIndex,
     ) -> Result<Option<(i64, f64)>> {
         if let Some(target_file) = edge.target_file.as_deref() {
-            if let Some(symbol_id) = unique_id(
-                self.db
-                    .get_symbol_by_name(&edge.target_name, Some(target_file))?,
-            ) {
+            if let Some(symbol_id) = symbol_index.unique_exact(&edge.target_name, Some(target_file))
+            {
                 return Ok(Some((symbol_id, 1.0)));
             }
         }
 
-        let Some(source_symbol) = self.db.get_symbol_by_id(edge.source_id)? else {
+        let Some(source_symbol) = symbol_index.source_symbol(edge.source_id) else {
             return Ok(None);
         };
         let source_file = source_symbol.file.as_str();
@@ -94,39 +173,34 @@ impl<'a> EdgeResolver<'a> {
             import_map.get(&(source_file.to_string(), base.to_string()))
         {
             if parts.len() == 1 {
-                if let Some(symbol_id) = unique_id(
-                    self.db
-                        .get_symbol_by_name(&edge.target_name, Some(resolved_file))?,
-                ) {
+                if let Some(symbol_id) =
+                    symbol_index.unique_exact(&edge.target_name, Some(resolved_file))
+                {
                     return Ok(Some((symbol_id, 0.95)));
                 }
                 if let Some(original_name) = original_name {
                     if original_name != &edge.target_name {
-                        if let Some(symbol_id) = unique_id(
-                            self.db
-                                .get_symbol_by_name(original_name, Some(resolved_file))?,
-                        ) {
+                        if let Some(symbol_id) =
+                            symbol_index.unique_exact(original_name, Some(resolved_file))
+                        {
                             return Ok(Some((symbol_id, 0.95)));
                         }
                     }
                 }
             } else {
                 let method = parts[1..].join(".");
-                let direct = self.db.get_symbol_by_name(&method, Some(resolved_file))?;
-                if let Some(symbol_id) = unique_id(direct) {
+                if let Some(symbol_id) = symbol_index.unique_exact(&method, Some(resolved_file)) {
                     return Ok(Some((symbol_id, 0.95)));
                 }
-                if let Some(symbol_id) = unique_id(
-                    self.db
-                        .get_symbol_by_name(&format!("{base}.{method}"), Some(resolved_file))?,
-                ) {
+                if let Some(symbol_id) =
+                    symbol_index.unique_exact(&format!("{base}.{method}"), Some(resolved_file))
+                {
                     return Ok(Some((symbol_id, 0.95)));
                 }
                 if let Some(original_name) = original_name {
-                    if let Some(symbol_id) = unique_id(self.db.get_symbol_by_name(
-                        &format!("{original_name}.{method}"),
-                        Some(resolved_file),
-                    )?) {
+                    if let Some(symbol_id) = symbol_index
+                        .unique_exact(&format!("{original_name}.{method}"), Some(resolved_file))
+                    {
                         return Ok(Some((symbol_id, 0.95)));
                     }
                 }
@@ -138,18 +212,11 @@ impl<'a> EdgeResolver<'a> {
             if let Some(class_prefix) = source_symbol.name.split_once('.').map(|(prefix, _)| prefix)
             {
                 let qualified = format!("{class_prefix}.{method}");
-                if let Some(symbol_id) =
-                    unique_id(self.db.get_symbol_by_name(&qualified, Some(source_file))?)
-                {
+                if let Some(symbol_id) = symbol_index.unique_exact(&qualified, Some(source_file)) {
                     return Ok(Some((symbol_id, 0.95)));
                 }
             }
-            let pattern = format!("%.{}", method);
-            if let Some(symbol_id) = unique_id(self.db.find_symbols_like_name(
-                &pattern,
-                Some(source_file),
-                20,
-            )?) {
+            if let Some(symbol_id) = symbol_index.unique_suffix(&method, Some(source_file)) {
                 return Ok(Some((symbol_id, 0.9)));
             }
         }
@@ -158,15 +225,15 @@ impl<'a> EdgeResolver<'a> {
             if !import_map.contains_key(&(source_file.to_string(), base.to_string())) {
                 let suffix = target_file.trim_start_matches("./");
                 let slash_suffix = format!("/{suffix}");
-                let matches = self
-                    .db
-                    .get_symbol_by_name(&edge.target_name, None)?
+                let matches = symbol_index
+                    .exact_symbols(&edge.target_name)
                     .into_iter()
                     .filter(|symbol| {
                         symbol.file.ends_with(suffix) || symbol.file.ends_with(&slash_suffix)
                     })
+                    .filter_map(|symbol| symbol.id)
                     .collect::<Vec<_>>();
-                if let Some(symbol_id) = unique_id(matches) {
+                if let Some(symbol_id) = unique_id_slice(&matches) {
                     return Ok(Some((symbol_id, 0.9)));
                 }
             }
@@ -174,8 +241,7 @@ impl<'a> EdgeResolver<'a> {
 
         let simple_name = parts.last().copied().unwrap_or(&edge.target_name);
         if simple_name != edge.target_name {
-            if let Some(symbol_id) = unique_id(self.db.get_symbol_by_name(&edge.target_name, None)?)
-            {
+            if let Some(symbol_id) = symbol_index.unique_exact(&edge.target_name, None) {
                 if parts[0].chars().next().is_some_and(char::is_uppercase) {
                     return Ok(Some((symbol_id, 1.0)));
                 }
@@ -183,12 +249,11 @@ impl<'a> EdgeResolver<'a> {
             }
         }
 
-        let pattern = format!("%.{}", simple_name);
-        if let Some(symbol_id) = unique_id(self.db.find_symbols_like_name(&pattern, None, 20)?) {
+        if let Some(symbol_id) = symbol_index.unique_suffix(simple_name, None) {
             return Ok(Some((symbol_id, 0.8)));
         }
 
-        if let Some(symbol_id) = unique_id(self.db.get_symbol_by_name(simple_name, None)?) {
+        if let Some(symbol_id) = symbol_index.unique_exact(simple_name, None) {
             return Ok(Some((symbol_id, 0.6)));
         }
 
@@ -196,9 +261,9 @@ impl<'a> EdgeResolver<'a> {
     }
 }
 
-fn unique_id(symbols: Vec<Symbol>) -> Option<i64> {
-    if symbols.len() == 1 {
-        symbols[0].id
+fn unique_id_slice(symbol_ids: &[i64]) -> Option<i64> {
+    if symbol_ids.len() == 1 {
+        Some(symbol_ids[0])
     } else {
         None
     }

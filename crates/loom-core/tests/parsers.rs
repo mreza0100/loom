@@ -19,6 +19,13 @@ fn has_edge(result: &ParseResult, source: &str, target: &str, relationship: &str
     })
 }
 
+fn has_symbol_kind(result: &ParseResult, name: &str, kind: &str) -> bool {
+    result
+        .symbols
+        .iter()
+        .any(|symbol| symbol.name == name && symbol.kind == kind)
+}
+
 #[test]
 fn registry_and_dispatcher_cover_builtin_extensions() {
     let registry = AdapterRegistry::with_builtin_adapters();
@@ -130,6 +137,7 @@ package main
 import ("fmt"; "example.com/base")
 type Base struct {}
 type Service struct { Base }
+type Runner interface { Start() }
 func Run() { fmt.Println("x") }
 func (s *Service) Start() { go Run() }
 "#,
@@ -140,6 +148,8 @@ func (s *Service) Start() { go Run() }
     for expected in ["Base", "Service", "Run", "Service.Start"] {
         assert!(names(&go).contains(expected), "missing go {expected}");
     }
+    assert!(has_symbol_kind(&go, "Base", "class"));
+    assert!(has_symbol_kind(&go, "Runner", "interface"));
     assert!(has_edge(&go, "Service.Start", "Run", "calls"));
 
     let java = parse_file(

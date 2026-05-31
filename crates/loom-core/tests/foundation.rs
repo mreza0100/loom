@@ -274,6 +274,7 @@ fn search_response_contract_json_shape_is_versioned() {
         score: 0.91,
         signal_scores: Default::default(),
         reason_codes: vec!["exact:name".to_string(), "semantic".to_string()],
+        graph_role: None,
         lexical_evidence: Some(LexicalEvidence {
             snippet: "function resolve_session()".to_string(),
             matched_text: "resolve_session".to_string(),
@@ -290,6 +291,7 @@ fn search_response_contract_json_shape_is_versioned() {
         contract: envelope.contract,
         version: envelope.version,
         index_revision: envelope.index_revision,
+        index_status: None,
         limit: envelope.limit,
         truncated: envelope.truncated,
         inspect_required: envelope.inspect_required,

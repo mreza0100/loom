@@ -493,6 +493,47 @@ impl LoomDb {
         collect_rows(rows)
     }
 
+    pub fn list_callsites_matching(
+        &self,
+        callee: &str,
+        file_contains: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Callsite>> {
+        let conn = self.reader()?;
+        let effective_limit = limit.min(MAX_SQL_LIMIT);
+        let mut sql = String::from(
+            "SELECT id, file, line, end_line, callee, receiver, unresolved_target,
+                    resolved_target_id, argument_summaries, imported_aliases,
+                    enclosing_symbol_id, enclosing_symbol_name, confidence, generic, downweighted
+             FROM callsites
+             WHERE (
+                callee = ?1
+                OR unresolved_target = ?1
+                OR unresolved_target LIKE '%' || ?1
+                OR callee LIKE '%' || ?1 || '%'
+             )",
+        );
+        let mut args = vec![callee.to_string()];
+        if let Some(pattern) = file_contains {
+            sql.push_str(" AND file LIKE '%' || ?2 || '%'");
+            args.push(pattern.to_string());
+        }
+        sql.push_str(
+            " ORDER BY
+                CASE WHEN resolved_target_id IS NOT NULL THEN 0 ELSE 1 END,
+                CASE WHEN file LIKE '%_test.go' THEN 1 ELSE 0 END,
+                file,
+                line,
+                unresolved_target,
+                id
+              LIMIT ?",
+        );
+        args.push(effective_limit.to_string());
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(args), row_to_callsite)?;
+        collect_rows(rows)
+    }
+
     pub fn get_callsite_by_id(&self, callsite_id: i64) -> Result<Option<Callsite>> {
         let conn = self.reader()?;
         conn.query_row(
@@ -878,6 +919,16 @@ impl LoomDb {
         collect_rows(rows)
     }
 
+    pub fn list_all_symbols(&self) -> Result<Vec<Symbol>> {
+        let conn = self.reader()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, kind, file, line, end_line, language, context
+             FROM symbols ORDER BY file, name, line",
+        )?;
+        let rows = stmt.query_map([], row_to_symbol)?;
+        collect_rows(rows)
+    }
+
     pub fn list_indexed_files(&self) -> Result<Vec<String>> {
         let conn = self.reader()?;
         let mut stmt = conn.prepare("SELECT file_path FROM index_meta ORDER BY file_path")?;
@@ -1003,6 +1054,105 @@ impl LoomDb {
             [],
         )?;
         Ok(changed)
+    }
+
+    pub fn resolve_callsites_by_symbol_name(&self) -> Result<usize> {
+        let mut conn = self.writer.lock();
+        let tx = conn.transaction()?;
+        let callsites = {
+            let mut stmt = tx.prepare(
+                "SELECT id, enclosing_symbol_id, callee, unresolved_target, generic
+                 FROM callsites
+                 WHERE resolved_target_id IS NULL
+                   AND enclosing_symbol_id IS NOT NULL",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)? != 0,
+                ))
+            })?;
+            collect_rows(rows)?
+        };
+        if callsites.is_empty() {
+            tx.commit()?;
+            return Ok(0);
+        }
+
+        let symbol_names = {
+            let mut stmt = tx.prepare("SELECT id, name FROM symbols ORDER BY id")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            collect_rows(rows)?
+        };
+        let mut exact_by_name = BTreeMap::<String, Vec<i64>>::new();
+        let mut suffix_by_name = BTreeMap::<String, Vec<i64>>::new();
+        for (symbol_id, name) in symbol_names {
+            exact_by_name
+                .entry(name.clone())
+                .or_default()
+                .push(symbol_id);
+            if let Some((_, suffix)) = name.rsplit_once('.') {
+                suffix_by_name
+                    .entry(suffix.to_string())
+                    .or_default()
+                    .push(symbol_id);
+            }
+        }
+
+        let mut inserted = 0usize;
+        let mut edge_stmt = tx.prepare(
+            "INSERT INTO edges
+             (source_id, target_id, target_name, target_file, relationship, confidence, original_name)
+             SELECT ?, ?, ?, NULL, 'calls', ?, ?
+             WHERE NOT EXISTS (
+                SELECT 1 FROM edges
+                WHERE source_id = ?
+                  AND target_id = ?
+                  AND relationship = 'calls'
+             )",
+        )?;
+        let mut callsite_stmt =
+            tx.prepare("UPDATE callsites SET resolved_target_id = ? WHERE id = ?")?;
+
+        for (callsite_id, source_id, callee, unresolved_target, generic) in callsites {
+            let candidates = callsite_symbol_candidates(
+                &exact_by_name,
+                &suffix_by_name,
+                &callee,
+                &unresolved_target,
+                source_id,
+            );
+            if candidates.is_empty() {
+                continue;
+            }
+            let confidence = if generic { 0.35 } else { 1.0 } / candidates.len() as f64;
+            let original_name = format!("callsite:fuzzy_name:{callsite_id}");
+            for target_id in &candidates {
+                let changed = edge_stmt.execute(params![
+                    source_id,
+                    target_id,
+                    callee,
+                    confidence,
+                    original_name,
+                    source_id,
+                    target_id,
+                ])?;
+                inserted += changed;
+            }
+            if candidates.len() == 1 {
+                callsite_stmt.execute(params![candidates[0], callsite_id])?;
+            }
+        }
+
+        drop(callsite_stmt);
+        drop(edge_stmt);
+        tx.commit()?;
+        Ok(inserted)
     }
 
     pub fn refresh_role_cards(&self) -> Result<()> {
@@ -1578,6 +1728,34 @@ fn row_to_edge(row: &Row<'_>) -> rusqlite::Result<Edge> {
         confidence: row.get(6)?,
         original_name: row.get(7)?,
     })
+}
+
+fn callsite_symbol_candidates(
+    exact_by_name: &BTreeMap<String, Vec<i64>>,
+    suffix_by_name: &BTreeMap<String, Vec<i64>>,
+    callee: &str,
+    unresolved_target: &str,
+    source_id: i64,
+) -> Vec<i64> {
+    let mut candidates = BTreeSet::new();
+    for name in [callee, unresolved_target] {
+        if let Some(ids) = exact_by_name.get(name) {
+            candidates.extend(ids.iter().copied());
+        }
+        if let Some(ids) = suffix_by_name.get(name) {
+            candidates.extend(ids.iter().copied());
+        }
+        if let Some((_, suffix)) = name.rsplit_once(['.', ':']) {
+            if let Some(ids) = exact_by_name.get(suffix) {
+                candidates.extend(ids.iter().copied());
+            }
+            if let Some(ids) = suffix_by_name.get(suffix) {
+                candidates.extend(ids.iter().copied());
+            }
+        }
+    }
+    candidates.remove(&source_id);
+    candidates.into_iter().collect()
 }
 
 fn insert_behavior_facts_in_transaction(

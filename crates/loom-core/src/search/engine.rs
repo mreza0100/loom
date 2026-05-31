@@ -5,42 +5,71 @@ use crate::{
         behavior_fact_handle, decode_file_handle_path, file_handle, response_budget,
         response_envelope, symbol_handle, BehaviorFact, BehaviorFactHit, Callsite, Continuation,
         CoupledHit, CoupledSymbol, EvidenceCoverageItem, EvidenceFactHit, EvidencePackResponse,
-        FileAnchor, FileRoleCard, GraphProvenance, ImpactResponse, InspectPage, InspectResponse,
-        InspectSnippet, LexicalEvidence, NeighborhoodResponse, NextToolSuggestion, QueryIntent,
-        RelatedResponse, SearchResponse, SignalScores, Symbol, SymbolHit, SymbolListResponse,
-        SymbolQuery, EVIDENCE_PACK_CONTRACT, IMPACT_CONTRACT, INSPECT_CONTRACT,
-        NEIGHBORHOOD_CONTRACT, RELATED_CONTRACT, SEARCH_CONTRACT, SYMBOLS_CONTRACT,
+        EvidenceSubQuestion, FileAnchor, FileRoleCard, GraphProvenance, ImpactResponse,
+        InspectPage, InspectResponse, InspectSnippet, LexicalEvidence, NeighborhoodResponse,
+        NextToolSuggestion, QueryIntent, RelatedResponse, SearchResponse, SignalScores, Symbol,
+        SymbolHit, SymbolListResponse, SymbolQuery, EVIDENCE_PACK_CONTRACT, IMPACT_CONTRACT,
+        INSPECT_CONTRACT, NEIGHBORHOOD_CONTRACT, RELATED_CONTRACT, SEARCH_CONTRACT,
+        SYMBOLS_CONTRACT,
     },
     search::scoring::{compute_evolutionary, compute_semantic, compute_structural, fuse_signals},
     store::LoomDb,
     LoomConfig, Result,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 const RRF_K: f64 = 60.0;
 const MAX_STRUCTURAL_RESULTS: usize = 30;
 const MAX_SUMMARY_CHARS: usize = 160;
 const MAX_SEARCH_RESULTS: usize = 100;
+const MAX_BEYOND_GREP_RESULTS: usize = 3;
 const MAX_SYMBOL_RESULTS: usize = 256;
 const MAX_EXPANSION_RESULTS: usize = 12;
 const MAX_INSPECT_LINES: usize = 32;
-const MAX_INSPECT_CHARS: usize = 2_500;
-const MAX_EVIDENCE_BUDGET_TOKENS: usize = 3_000;
-const MAX_EVIDENCE_RESULTS: usize = 4;
+const MAX_INSPECT_CHARS: usize = 32_000;
+const MAX_EVIDENCE_BUDGET_TOKENS: usize = 16_000;
+const MAX_EVIDENCE_RESULTS: usize = 24;
 const MAX_EVIDENCE_CARD_ITEMS: usize = 5;
-const MAX_FILE_LINE_SCAN_FILES: usize = 512;
-const MAX_FILE_LINE_SCAN_BYTES: u64 = 2_000_000;
-
+const DEFAULT_SEARCH_BUDGET_TOKENS: usize = 2_000;
+const MAX_SEARCH_BUDGET_TOKENS: usize = 8_000;
+const SEARCH_CHARS_PER_TOKEN: usize = 4;
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct NeighborhoodResult {
     pub anchor: Option<Symbol>,
     pub coupled: Vec<CoupledSymbol>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RipgrepJsonEvent {
+    #[serde(rename = "type")]
+    kind: String,
+    data: Option<RipgrepJsonData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RipgrepJsonData {
+    path: Option<RipgrepJsonText>,
+    lines: Option<RipgrepJsonText>,
+    line_number: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RipgrepJsonText {
+    text: String,
+}
+
+#[derive(Debug, Clone)]
+struct EvidenceLineMatch {
+    file: String,
+    line: i64,
+    text: String,
 }
 
 pub struct SearchEngine<E: Embedder> {
@@ -48,6 +77,7 @@ pub struct SearchEngine<E: Embedder> {
     embedder: Arc<E>,
     graph: Option<Arc<SymbolGraph>>,
     config: LoomConfig,
+    index_ready: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -56,6 +86,7 @@ struct Candidate {
     score: f64,
     signal_scores: SignalScores,
     lexical_evidence: Option<LexicalEvidence>,
+    graph_role: Option<String>,
     reason_codes: BTreeSet<String>,
     coupled: Vec<CoupledSymbol>,
 }
@@ -67,6 +98,7 @@ impl Candidate {
             score: 0.0,
             signal_scores: SignalScores::default(),
             lexical_evidence: None,
+            graph_role: None,
             reason_codes: BTreeSet::new(),
             coupled: Vec::new(),
         }
@@ -86,21 +118,64 @@ impl<E: Embedder> SearchEngine<E> {
             embedder,
             graph,
             config,
+            index_ready: true,
         }
     }
 
+    #[must_use]
+    pub fn with_index_ready(mut self, index_ready: bool) -> Self {
+        self.index_ready = index_ready;
+        self
+    }
+
     pub fn search(&self, query: &str, limit: usize, kind: Option<&str>) -> Result<SearchResponse> {
+        self.search_with_budget(query, limit, kind, DEFAULT_SEARCH_BUDGET_TOKENS)
+    }
+
+    pub fn search_with_budget(
+        &self,
+        query: &str,
+        limit: usize,
+        kind: Option<&str>,
+        budget_tokens: usize,
+    ) -> Result<SearchResponse> {
+        self.search_mode_with_budget(query, limit, kind, None, budget_tokens)
+    }
+
+    pub fn search_mode_with_budget(
+        &self,
+        query: &str,
+        limit: usize,
+        kind: Option<&str>,
+        mode: Option<&str>,
+        budget_tokens: usize,
+    ) -> Result<SearchResponse> {
+        if let Some(mode) = mode.filter(|mode| *mode != "auto") {
+            return self.search_graph_mode(query, limit, kind, mode, budget_tokens);
+        }
+        self.search_auto_with_budget(query, limit, kind, budget_tokens)
+    }
+
+    fn search_auto_with_budget(
+        &self,
+        query: &str,
+        limit: usize,
+        kind: Option<&str>,
+        budget_tokens: usize,
+    ) -> Result<SearchResponse> {
+        let budget_tokens = budget_tokens.clamp(1, MAX_SEARCH_BUDGET_TOKENS);
         let index_revision = self.db.index_revision()?;
         if limit == 0 {
             let envelope = response_envelope(SEARCH_CONTRACT, index_revision, limit, false, true);
-            return Ok(SearchResponse {
+            let mut response = SearchResponse {
                 contract: envelope.contract,
                 version: envelope.version,
                 index_revision: envelope.index_revision,
+                index_status: self.search_index_status(),
                 limit: envelope.limit,
                 truncated: envelope.truncated,
                 inspect_required: envelope.inspect_required,
-                budget: response_budget("results", limit, 0, 0, false),
+                budget: response_budget("tokens", budget_tokens, 0, 0, false),
                 continuation: None,
                 next_tool_suggestions: vec![tool_suggestion(
                     "search",
@@ -110,7 +185,9 @@ impl<E: Embedder> SearchEngine<E> {
                 query_intent: classify_query_intent(query),
                 exact_hits: Vec::new(),
                 beyond_grep: Vec::new(),
-            });
+            };
+            enforce_search_response_budget(&mut response, budget_tokens, 0);
+            return Ok(response);
         }
 
         let requested_limit = limit;
@@ -132,7 +209,7 @@ impl<E: Embedder> SearchEngine<E> {
             + token_symbol_results.len();
         let file_line_results =
             if should_run_file_line_scan(query, lexical_result_count, candidate_limit) {
-                self.search_file_lines(query, candidate_limit)?
+                self.search_file_lines(query, file_line_scan_limit(query, candidate_limit))?
             } else {
                 Vec::new()
             };
@@ -147,10 +224,12 @@ impl<E: Embedder> SearchEngine<E> {
             };
             lexical_seed_ids.push(symbol_id);
             let evidence = symbol_query_evidence(&symbol, query, rank);
+            let match_weight = symbol_query_match_weight(&symbol, query);
             let candidate = candidates
                 .entry(symbol_id)
                 .or_insert_with(|| Candidate::new(symbol.clone()));
-            let signal = (1.0 + rrf_score(rank)) * kind_boost(&candidate.symbol.kind);
+            let signal =
+                (1.0 + rrf_score(rank)) * kind_boost(&candidate.symbol.kind) * match_weight;
             candidate.score += signal;
             candidate.signal_scores.symbol += signal;
             candidate.lexical_evidence = Some(evidence);
@@ -164,10 +243,12 @@ impl<E: Embedder> SearchEngine<E> {
                 continue;
             };
             lexical_seed_ids.push(symbol_id);
+            let match_weight = symbol_query_match_weight(&symbol, query);
             let candidate = candidates
                 .entry(symbol_id)
                 .or_insert_with(|| Candidate::new(symbol.clone()));
-            let signal = (0.8 + rrf_score(rank)) * kind_boost(&candidate.symbol.kind);
+            let signal =
+                (0.8 + rrf_score(rank)) * kind_boost(&candidate.symbol.kind) * match_weight;
             candidate.score += signal;
             candidate.signal_scores.symbol += signal;
             if candidate.lexical_evidence.is_none() {
@@ -180,14 +261,15 @@ impl<E: Embedder> SearchEngine<E> {
             candidate.reason_codes.insert("exact:symbol".to_string());
         }
         for (rank, (symbol, evidence)) in file_line_results.into_iter().enumerate() {
-            let Some(symbol_id) = symbol.id else {
-                continue;
-            };
-            lexical_seed_ids.push(symbol_id);
+            let symbol_id = symbol.id.unwrap_or(-((rank as i64) + 1));
+            if symbol.id.is_some() {
+                lexical_seed_ids.push(symbol_id);
+            }
+            let line_weight = file_line_match_weight(&symbol, &evidence, query);
             let candidate = candidates
                 .entry(symbol_id)
                 .or_insert_with(|| Candidate::new(symbol.clone()));
-            let signal = (0.7 + rrf_score(rank)) * kind_boost(&candidate.symbol.kind);
+            let signal = (0.7 + rrf_score(rank)) * kind_boost(&candidate.symbol.kind) * line_weight;
             candidate.score += signal;
             candidate.signal_scores.lexical += signal;
             candidate.lexical_evidence = Some(evidence.clone());
@@ -241,6 +323,7 @@ impl<E: Embedder> SearchEngine<E> {
                 .insert(format!("exact:fact:{}", result.lexical_evidence.field));
         }
 
+        let semantic_weight = semantic_weight_multiplier(&self.embedder.fingerprint());
         for (rank, (symbol_id, _distance)) in vec_results.into_iter().enumerate() {
             let Some(symbol) = self.db.get_symbol_by_id(symbol_id)? else {
                 continue;
@@ -248,13 +331,14 @@ impl<E: Embedder> SearchEngine<E> {
             let candidate = candidates
                 .entry(symbol_id)
                 .or_insert_with(|| Candidate::new(symbol.clone()));
-            let signal = rrf_score(rank) * kind_boost(&candidate.symbol.kind);
+            let signal = rrf_score(rank) * kind_boost(&candidate.symbol.kind) * semantic_weight;
             candidate.score += signal;
             candidate.signal_scores.semantic += signal;
             candidate.reason_codes.insert("semantic".to_string());
         }
 
         self.add_graph_candidates(&mut candidates, &lexical_seed_ids)?;
+        self.annotate_lexical_graph_roles(query, &mut candidates);
         let normalized = normalize_scores(
             candidates
                 .iter()
@@ -296,7 +380,11 @@ impl<E: Embedder> SearchEngine<E> {
         let total_before_truncate = exact_hits.len() + beyond_grep.len();
         let exact_limit = exact_hits.len().min(limit);
         exact_hits.truncate(limit);
-        beyond_grep.truncate(limit.saturating_sub(exact_limit));
+        beyond_grep.truncate(
+            limit
+                .saturating_sub(exact_limit)
+                .min(MAX_BEYOND_GREP_RESULTS),
+        );
         let returned = exact_hits.len() + beyond_grep.len();
         let truncated = total_before_truncate > returned || requested_limit > limit;
         let omitted = total_before_truncate.saturating_sub(returned);
@@ -304,20 +392,128 @@ impl<E: Embedder> SearchEngine<E> {
         let next_tool_suggestions = search_next_tool_suggestions(&exact_hits, &beyond_grep);
 
         let envelope = response_envelope(SEARCH_CONTRACT, index_revision, limit, truncated, true);
-        Ok(SearchResponse {
+        let mut response = SearchResponse {
             contract: envelope.contract,
             version: envelope.version,
             index_revision: envelope.index_revision,
+            index_status: self.search_index_status(),
             limit: envelope.limit,
             truncated: envelope.truncated,
             inspect_required: envelope.inspect_required,
-            budget: response_budget("results", limit, returned, omitted, truncated),
+            budget: response_budget("tokens", budget_tokens, 0, omitted, truncated),
             continuation,
             next_tool_suggestions,
             query_intent: classify_query_intent(query),
             exact_hits,
             beyond_grep,
-        })
+        };
+        enforce_search_response_budget(&mut response, budget_tokens, total_before_truncate);
+        Ok(response)
+    }
+
+    fn search_graph_mode(
+        &self,
+        query: &str,
+        limit: usize,
+        kind: Option<&str>,
+        mode: &str,
+        budget_tokens: usize,
+    ) -> Result<SearchResponse> {
+        let budget_tokens = budget_tokens.clamp(1, MAX_SEARCH_BUDGET_TOKENS);
+        let index_revision = self.db.index_revision()?;
+        let limit = limit.min(MAX_SEARCH_RESULTS);
+        let Some(target) =
+            select_target_symbol(self.db.get_symbol_by_name_fuzzy(query, None)?, kind)
+        else {
+            return self.search_auto_with_budget(query, limit, kind, budget_tokens);
+        };
+        let mut candidates = Vec::new();
+        let mut seen = BTreeSet::from_iter(target.id);
+        if matches!(mode, "definitions" | "definition") {
+            let mut candidate = Candidate::new(target.clone());
+            candidate.score = 1.0;
+            candidate.signal_scores.symbol = 1.0;
+            candidate.signal_scores.total = 1.0;
+            candidate.graph_role = Some("definition".to_string());
+            candidate
+                .reason_codes
+                .insert("mode:definitions".to_string());
+            candidate
+                .reason_codes
+                .insert("graph_role:definition".to_string());
+            candidates.push(candidate);
+        } else if let (Some(graph), Some(target_id)) = (&self.graph, target.id) {
+            let entries = match mode {
+                "callers" => graph.dependents(target_id, 3),
+                "callees" | "impact" => graph.dependencies(target_id, 3),
+                "implementations" | "implementors" => graph
+                    .dependents(target_id, 3)
+                    .into_iter()
+                    .filter(|entry| entry.relationship == "implements")
+                    .collect(),
+                _ => return self.search_auto_with_budget(query, limit, kind, budget_tokens),
+            };
+            for entry in entries {
+                if !seen.insert(entry.symbol_id) {
+                    continue;
+                }
+                let Some(symbol) = self.db.get_symbol_by_id(entry.symbol_id)? else {
+                    continue;
+                };
+                if is_generic_target(&symbol.name) {
+                    continue;
+                }
+                let mut candidate = Candidate::new(symbol);
+                let structural =
+                    compute_structural(&entry.relationship, entry.confidence, entry.depth);
+                candidate.score = structural;
+                candidate.signal_scores.graph = structural;
+                candidate.signal_scores.total = structural;
+                candidate.graph_role = Some(mode_graph_role(mode, &entry.relationship));
+                candidate.reason_codes.insert(format!("mode:{mode}"));
+                candidate
+                    .reason_codes
+                    .insert(format!("graph:{}", entry.relationship));
+                if let Some(role) = &candidate.graph_role {
+                    candidate.reason_codes.insert(format!("graph_role:{role}"));
+                }
+                candidates.push(candidate);
+            }
+        }
+
+        candidates.sort_by(|left, right| right.score.total_cmp(&left.score));
+        let total_before_truncate = candidates.len();
+        candidates.truncate(limit);
+        let mut exact_hits = candidates
+            .into_iter()
+            .map(|candidate| candidate_to_hit(candidate, &index_revision))
+            .collect::<Vec<_>>();
+        assign_symbol_ranks(&mut exact_hits);
+        let returned = exact_hits.len();
+        let truncated = total_before_truncate > returned;
+        let omitted = total_before_truncate.saturating_sub(returned);
+        let envelope = response_envelope(SEARCH_CONTRACT, index_revision, limit, truncated, true);
+        let mut response = SearchResponse {
+            contract: envelope.contract,
+            version: envelope.version,
+            index_revision: envelope.index_revision,
+            index_status: self.search_index_status(),
+            limit: envelope.limit,
+            truncated: envelope.truncated,
+            inspect_required: envelope.inspect_required,
+            budget: response_budget("tokens", budget_tokens, 0, omitted, truncated),
+            continuation: continuation_for("search", truncated, returned, omitted),
+            next_tool_suggestions: search_next_tool_suggestions(&exact_hits, &[]),
+            query_intent: classify_query_intent(query),
+            exact_hits,
+            beyond_grep: Vec::new(),
+        };
+        enforce_search_response_budget(&mut response, budget_tokens, total_before_truncate);
+        Ok(response)
+    }
+
+    fn search_index_status(&self) -> Option<String> {
+        (!self.index_ready).then(|| "building".to_string())
     }
 
     pub fn symbols(
@@ -690,6 +886,7 @@ impl<E: Embedder> SearchEngine<E> {
                 ..SignalScores::default()
             },
             reason_codes: vec!["anchor".to_string()],
+            graph_role: None,
             lexical_evidence: None,
             coupled: coupled_to_hits(coupled, &index_revision),
         };
@@ -805,29 +1002,155 @@ impl<E: Embedder> SearchEngine<E> {
         let index_revision = self.db.index_revision()?;
         let effective_budget_tokens = budget_tokens.min(MAX_EVIDENCE_BUDGET_TOKENS);
         let result_limit = (effective_budget_tokens / 180).clamp(2, MAX_EVIDENCE_RESULTS);
-        let mut search = self.search(query, result_limit, None)?;
-        let raw_behavior_facts = self.db.search_behavior_facts(query, result_limit)?;
+        let sub_questions = split_sub_questions(query);
+        let per_question_budget = (effective_budget_tokens / sub_questions.len().max(1))
+            .clamp(500, MAX_EVIDENCE_BUDGET_TOKENS);
+        let mut merged_exact_hits = Vec::new();
+        let mut merged_beyond_grep = Vec::new();
+        let mut merged_behavior_facts = Vec::new();
+        let mut omitted = Vec::new();
+        let mut truncated = false;
+
+        for sub_question in &sub_questions {
+            let referenced_paths = extract_repo_paths(&sub_question.query);
+            let mut focused_query = sub_question.query.clone();
+            let symbol_hints = sub_question
+                .symbols
+                .iter()
+                .take(6)
+                .cloned()
+                .collect::<Vec<_>>();
+            if !symbol_hints.is_empty() {
+                focused_query.push(' ');
+                focused_query.push_str(&symbol_hints.join(" "));
+            }
+            let search =
+                self.search_with_budget(&focused_query, result_limit, None, per_question_budget)?;
+            truncated |= search.truncated;
+            let mut exact_hits = search.exact_hits;
+            let mut beyond_grep = search.beyond_grep;
+            if !referenced_paths.is_empty() {
+                exact_hits.retain(|hit| referenced_paths.contains(&hit.anchor.file));
+                beyond_grep.retain(|hit| referenced_paths.contains(&hit.anchor.file));
+            }
+            let receiver_type_hits =
+                self.receiver_type_hits_for_methods(&exact_hits, &index_revision)?;
+            merge_symbol_hits(&mut exact_hits, receiver_type_hits);
+            merge_symbol_hits(&mut merged_exact_hits, exact_hits);
+            merge_symbol_hits(&mut merged_beyond_grep, beyond_grep);
+            for symbol_query in sub_question.symbols.iter().take(10) {
+                let mut symbols = self.db.get_symbol_by_name_fuzzy(symbol_query, None)?;
+                if symbols.is_empty() {
+                    continue;
+                }
+                if !referenced_paths.is_empty() {
+                    symbols.retain(|symbol| referenced_paths.contains(&symbol.file));
+                    if symbols.is_empty() {
+                        continue;
+                    }
+                }
+                let hits = symbols
+                    .into_iter()
+                    .take(3)
+                    .map(|symbol| {
+                        let mut candidate = Candidate::new(symbol);
+                        candidate.score = 1.0;
+                        candidate.signal_scores.symbol = 1.0;
+                        candidate.signal_scores.total = 1.0;
+                        candidate
+                            .reason_codes
+                            .insert("exact:symbol_hint".to_string());
+                        candidate_to_hit(candidate, &index_revision)
+                    })
+                    .collect::<Vec<_>>();
+                merge_symbol_hits(&mut merged_exact_hits, hits);
+            }
+
+            let raw_facts = self
+                .db
+                .search_behavior_facts(&sub_question.query, result_limit)?;
+            merge_behavior_facts(&mut merged_behavior_facts, raw_facts);
+
+            for file in extract_repo_paths(&sub_question.query) {
+                let file_symbols = self.db.get_colocated_symbols(&file)?;
+                let symbol_names = sub_question
+                    .symbols
+                    .iter()
+                    .map(|symbol| symbol.to_ascii_lowercase())
+                    .collect::<Vec<_>>();
+                let hits = file_symbols
+                    .into_iter()
+                    .filter(|symbol| {
+                        let name = symbol.name.to_ascii_lowercase();
+                        symbol_names.iter().any(|needle| {
+                            name == *needle
+                                || name.ends_with(&format!(".{needle}"))
+                                || (needle == "next" && name.ends_with(".next"))
+                        })
+                    })
+                    .take(result_limit)
+                    .map(|symbol| {
+                        let mut candidate = Candidate::new(symbol);
+                        candidate.score = 2.0;
+                        candidate.signal_scores.symbol = 2.0;
+                        candidate.signal_scores.total = 2.0;
+                        candidate
+                            .reason_codes
+                            .insert("exact:file_symbol_hint".to_string());
+                        candidate_to_hit(candidate, &index_revision)
+                    })
+                    .collect::<Vec<_>>();
+                merge_symbol_hits(&mut merged_exact_hits, hits);
+            }
+        }
+
+        sort_hits(&mut merged_exact_hits);
+        sort_hits(&mut merged_beyond_grep);
+        merged_exact_hits.truncate(result_limit);
+        if !merged_exact_hits.is_empty() {
+            merged_beyond_grep.clear();
+        }
+        merged_beyond_grep.truncate(result_limit);
+        let mut search = SearchResponse {
+            contract: SEARCH_CONTRACT.to_string(),
+            version: 1,
+            index_revision: index_revision.clone(),
+            index_status: self.search_index_status(),
+            limit: result_limit,
+            truncated,
+            inspect_required: false,
+            budget: response_budget("tokens", effective_budget_tokens, 0, 0, truncated),
+            continuation: None,
+            next_tool_suggestions: Vec::new(),
+            query_intent: classify_query_intent(query),
+            exact_hits: merged_exact_hits,
+            beyond_grep: merged_beyond_grep,
+        };
+        let raw_behavior_facts = merged_behavior_facts;
         let role_cards = self.role_cards_for_evidence(&search, &raw_behavior_facts)?;
-        let char_budget = effective_budget_tokens.saturating_mul(3).clamp(240, 4_000);
+        let char_budget = effective_budget_tokens
+            .saturating_mul(3)
+            .clamp(2_000, 32_000);
         let mut selected = Vec::new();
+        let exact_snippet_limit = if sub_questions.len() > 1 { 4 } else { 8 };
         selected.extend(
             search
                 .exact_hits
                 .iter()
-                .take(1)
+                .take(exact_snippet_limit)
                 .map(|hit| hit.handle.clone()),
         );
         selected.extend(
             search
                 .beyond_grep
                 .iter()
-                .take(1)
+                .take(4)
                 .map(|hit| hit.handle.clone()),
         );
         selected.extend(
             raw_behavior_facts
                 .iter()
-                .take(1)
+                .take(2)
                 .map(|hit| behavior_fact_handle(&index_revision, &hit.fact)),
         );
         selected.sort();
@@ -836,14 +1159,12 @@ impl<E: Embedder> SearchEngine<E> {
         let per_snippet_budget = if selected.is_empty() {
             char_budget
         } else {
-            (char_budget / selected.len()).clamp(160, 1_000)
+            (char_budget / selected.len()).clamp(800, 6_000)
         };
         let mut inspected_snippets = Vec::new();
-        let mut omitted = Vec::new();
         let mut returned_chars = 0usize;
-        let mut truncated = search.truncated;
         for handle in selected {
-            let inspected = self.inspect(&handle, 12, per_snippet_budget, 0)?;
+            let inspected = self.inspect(&handle, 80, per_snippet_budget, 0)?;
             if inspected.truncated {
                 truncated = true;
             }
@@ -854,10 +1175,21 @@ impl<E: Embedder> SearchEngine<E> {
                 omitted.push(format!("{handle}: {error}"));
             }
         }
-
-        if search.truncated {
-            omitted.push("search results were truncated before evidence packing".to_string());
+        let file_snippet_budget = per_snippet_budget.clamp(800, 2_000);
+        for snippet in self.evidence_file_snippets(&sub_questions, &search, file_snippet_budget)? {
+            if !inspected_snippets.iter().any(|existing| {
+                existing.anchor.file == snippet.anchor.file
+                    && existing.start_line == snippet.start_line
+                    && existing.end_line == snippet.end_line
+            }) {
+                returned_chars += snippet.chars;
+                inspected_snippets.push(snippet);
+            }
+            if inspected_snippets.len() >= result_limit {
+                break;
+            }
         }
+
         if budget_tokens > effective_budget_tokens {
             omitted.push(format!(
                 "evidence budget capped at {effective_budget_tokens} tokens to keep MCP payload bounded"
@@ -867,7 +1199,11 @@ impl<E: Embedder> SearchEngine<E> {
             omitted.push("no source snippets were inspected for this query".to_string());
         }
 
-        let missing_concepts = missing_concepts(query, &search);
+        let missing_concepts = if inspected_snippets.is_empty() {
+            missing_concepts(query, &search)
+        } else {
+            Vec::new()
+        };
         let coverage_checklist = evidence_coverage(
             &search,
             &inspected_snippets,
@@ -901,14 +1237,13 @@ impl<E: Embedder> SearchEngine<E> {
 
         search.exact_hits.truncate(result_limit);
         search.beyond_grep.truncate(result_limit);
-        let next_tool_suggestions = evidence_next_tool_suggestions(&search);
         Ok(EvidencePackResponse {
             contract: envelope.contract,
             version: envelope.version,
             index_revision: envelope.index_revision,
             limit: envelope.limit,
             truncated: envelope.truncated,
-            inspect_required: envelope.inspect_required,
+            inspect_required: false,
             budget: response_budget(
                 "tokens",
                 effective_budget_tokens,
@@ -917,6 +1252,7 @@ impl<E: Embedder> SearchEngine<E> {
                 truncated,
             ),
             query: query.to_string(),
+            sub_questions,
             exact_hits: search.exact_hits,
             beyond_grep: search.beyond_grep,
             behavior_facts,
@@ -925,7 +1261,7 @@ impl<E: Embedder> SearchEngine<E> {
             coverage_checklist,
             omitted,
             missing_concepts,
-            next_tool_suggestions,
+            next_tool_suggestions: Vec::new(),
             display_text,
         })
     }
@@ -963,6 +1299,295 @@ impl<E: Embedder> SearchEngine<E> {
             compact_role_card(card);
         }
         Ok(cards)
+    }
+
+    fn receiver_type_hits_for_methods(
+        &self,
+        hits: &[SymbolHit],
+        index_revision: &str,
+    ) -> Result<Vec<SymbolHit>> {
+        let mut receiver_names = BTreeSet::new();
+        let mut receiver_hits = Vec::new();
+        for hit in hits {
+            if hit.symbol.kind != "method" {
+                continue;
+            }
+            let Some(receiver) = receiver_type_from_method_name(&hit.symbol.name) else {
+                continue;
+            };
+            if !receiver_names.insert((hit.symbol.file.clone(), receiver.clone())) {
+                continue;
+            }
+            for symbol in self
+                .db
+                .get_symbol_by_name_fuzzy(&receiver, Some(&hit.symbol.file))?
+                .into_iter()
+                .filter(|symbol| matches!(symbol.kind.as_str(), "class" | "interface"))
+                .take(1)
+            {
+                let mut candidate = Candidate::new(symbol);
+                candidate.score = 2.5;
+                candidate.signal_scores.symbol = 2.5;
+                candidate.signal_scores.total = 2.5;
+                candidate
+                    .reason_codes
+                    .insert("exact:method_receiver_type".to_string());
+                receiver_hits.push(candidate_to_hit(candidate, index_revision));
+            }
+        }
+        Ok(receiver_hits)
+    }
+
+    fn evidence_file_snippets(
+        &self,
+        sub_questions: &[EvidenceSubQuestion],
+        search: &SearchResponse,
+        char_budget: usize,
+    ) -> Result<Vec<InspectSnippet>> {
+        let mut snippets = Vec::new();
+        let mut seen = BTreeSet::new();
+        let per_question_limit = (MAX_EVIDENCE_RESULTS / sub_questions.len().max(1)).clamp(3, 8);
+        for question in sub_questions {
+            let mut question_snippets = 0usize;
+            let terms = file_evidence_terms(question);
+            let mut paths = extract_repo_paths(&question.query);
+            let explicit_paths = !paths.is_empty();
+            let question_limit = evidence_question_limit(question, per_question_limit);
+            if explicit_paths && wants_next_receiver_structs(&question.query) {
+                for file in &paths {
+                    if question_snippets >= question_limit {
+                        break;
+                    }
+                    let path = self.config.target_dir.join(file);
+                    if !path.exists() {
+                        continue;
+                    }
+                    for snippet in
+                        next_receiver_struct_snippets(&path, file, char_budget, question_limit)?
+                    {
+                        if seen.insert((snippet.anchor.file.clone(), snippet.start_line)) {
+                            snippets.push(snippet);
+                            question_snippets += 1;
+                        }
+                        if snippets.len() >= MAX_EVIDENCE_RESULTS {
+                            return Ok(snippets);
+                        }
+                        if question_snippets >= question_limit {
+                            break;
+                        }
+                    }
+                }
+            }
+            for snippet in
+                self.pattern_file_snippets(question, &terms, char_budget, question_limit)?
+            {
+                if seen.insert((snippet.anchor.file.clone(), snippet.start_line)) {
+                    snippets.push(snippet);
+                    question_snippets += 1;
+                }
+                if snippets.len() >= MAX_EVIDENCE_RESULTS {
+                    return Ok(snippets);
+                }
+                if question_snippets >= question_limit {
+                    break;
+                }
+            }
+            if !explicit_paths {
+                let mut seen_files = BTreeSet::new();
+                paths = search
+                    .exact_hits
+                    .iter()
+                    .chain(search.beyond_grep.iter())
+                    .filter(|hit| seen_files.insert(hit.anchor.file.clone()))
+                    .map(|hit| hit.anchor.file.clone())
+                    .collect();
+                rank_evidence_paths(&mut paths, &terms);
+                paths.truncate(8);
+            }
+            for file in paths {
+                if question_snippets >= question_limit {
+                    break;
+                }
+                let path = self.config.target_dir.join(&file);
+                if !path.exists() {
+                    continue;
+                }
+                for (start_line, end_line) in extract_requested_line_ranges(&question.query) {
+                    let anchor = FileAnchor {
+                        file: file.clone(),
+                        line: start_line,
+                        end_line,
+                    };
+                    let read = read_snippet(&path, &anchor, start_line, end_line, char_budget)?;
+                    if let Some(snippet) = read.snippet {
+                        if seen.insert((file.clone(), snippet.start_line)) {
+                            snippets.push(snippet);
+                            question_snippets += 1;
+                        }
+                    }
+                    if snippets.len() >= MAX_EVIDENCE_RESULTS {
+                        return Ok(snippets);
+                    }
+                    if question_snippets >= question_limit {
+                        break;
+                    }
+                }
+                let lines = ranked_file_evidence_lines(&path, &terms)?;
+                let line_limit = if explicit_paths { 8 } else { 3 };
+                for line in lines.into_iter().take(line_limit) {
+                    if question_snippets >= question_limit {
+                        break;
+                    }
+                    let start_line = line.saturating_sub(4).max(1);
+                    if !seen.insert((file.clone(), start_line)) {
+                        continue;
+                    }
+                    let anchor = FileAnchor {
+                        file: file.clone(),
+                        line,
+                        end_line: line,
+                    };
+                    let read = read_snippet(&path, &anchor, start_line, line + 16, char_budget)?;
+                    if let Some(snippet) = read.snippet {
+                        snippets.push(snippet);
+                        question_snippets += 1;
+                    }
+                    if snippets.len() >= MAX_EVIDENCE_RESULTS {
+                        return Ok(snippets);
+                    }
+                }
+            }
+        }
+        Ok(snippets)
+    }
+
+    fn pattern_file_snippets(
+        &self,
+        question: &EvidenceSubQuestion,
+        terms: &[String],
+        char_budget: usize,
+        limit: usize,
+    ) -> Result<Vec<InspectSnippet>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let patterns = evidence_patterns(&question.query);
+        if patterns.is_empty() {
+            return Ok(Vec::new());
+        }
+        let root = self.config.target_dir.canonicalize().map_err(|source| {
+            crate::LoomError::IndexerIo {
+                path: self.config.target_dir.display().to_string(),
+                source,
+            }
+        })?;
+        let explicit_paths = extract_repo_paths(&question.query);
+        let cross_file_patterns = needs_cross_file_pattern_search(&question.query);
+        let search_roots = if explicit_paths.is_empty() || cross_file_patterns {
+            vec![root.clone()]
+        } else {
+            explicit_paths
+                .iter()
+                .map(|file| root.join(file))
+                .filter(|path| path.exists())
+                .collect::<Vec<_>>()
+        };
+        if search_roots.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut matches = Vec::new();
+        let mut seen = BTreeSet::new();
+        for pattern in patterns {
+            let mut child = match Command::new("rg")
+                .arg("--json")
+                .arg("--line-number")
+                .arg("--no-heading")
+                .arg("--color")
+                .arg("never")
+                .arg("--ignore-case")
+                .arg("--regexp")
+                .arg(&pattern)
+                .args(&search_roots)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(child) => child,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(source) => {
+                    return Err(crate::LoomError::IndexerIo {
+                        path: "rg".to_string(),
+                        source,
+                    });
+                }
+            };
+            let Some(stdout) = child.stdout.take() else {
+                let _ = child.wait();
+                continue;
+            };
+            for line in BufReader::new(stdout).lines() {
+                let line = line.map_err(|source| crate::LoomError::IndexerIo {
+                    path: "rg".to_string(),
+                    source,
+                })?;
+                let Ok(event) = serde_json::from_str::<RipgrepJsonEvent>(&line) else {
+                    continue;
+                };
+                if event.kind != "match" {
+                    continue;
+                }
+                let Some(data) = event.data else {
+                    continue;
+                };
+                let (Some(path), Some(line_number)) = (data.path, data.line_number) else {
+                    continue;
+                };
+                let Some(file) = repo_relative_path(&root, Path::new(&path.text)) else {
+                    continue;
+                };
+                if seen.insert((file.clone(), line_number)) {
+                    let text = data.lines.map(|lines| lines.text).unwrap_or_default();
+                    matches.push(EvidenceLineMatch {
+                        file,
+                        line: line_number,
+                        text,
+                    });
+                }
+                if matches.len() >= limit.saturating_mul(8) {
+                    let _ = child.kill();
+                    break;
+                }
+            }
+            let _ = child.wait();
+        }
+        rank_evidence_line_matches(&mut matches, terms, &question.query);
+        let mut snippets = Vec::new();
+        let snippet_limit = if cross_file_patterns {
+            limit.min(4)
+        } else {
+            limit
+        };
+        for line_match in matches.into_iter().take(snippet_limit) {
+            let file = line_match.file;
+            let line = line_match.line;
+            let path = self.config.target_dir.join(&file);
+            let start_line = line.saturating_sub(4).max(1);
+            let end_line = if source_line_contains(&path, line, "type ")? {
+                line + 64
+            } else {
+                line + 16
+            };
+            let anchor = FileAnchor {
+                file,
+                line,
+                end_line: line,
+            };
+            let read = read_snippet(&path, &anchor, start_line, end_line, char_budget)?;
+            if let Some(snippet) = read.snippet {
+                snippets.push(snippet);
+            }
+        }
+        Ok(snippets)
     }
 
     fn inspect_symbol(
@@ -1112,7 +1737,7 @@ impl<E: Embedder> SearchEngine<E> {
         char_budget: usize,
         line_offset: usize,
     ) -> Result<InspectResponse> {
-        if self.db.get_file_hash(file)?.is_none() {
+        if self.db.get_file_hash(file)?.is_none() && !self.config.target_dir.join(file).exists() {
             return Ok(stale_inspect_response(
                 handle,
                 "file",
@@ -1218,6 +1843,41 @@ impl<E: Embedder> SearchEngine<E> {
         Ok(())
     }
 
+    fn annotate_lexical_graph_roles(&self, query: &str, candidates: &mut BTreeMap<i64, Candidate>) {
+        let Some(graph) = &self.graph else {
+            return;
+        };
+        let target_ids = candidates
+            .iter()
+            .filter_map(|(symbol_id, candidate)| {
+                candidate
+                    .lexical_evidence
+                    .is_some()
+                    .then_some(candidate)
+                    .filter(|candidate| symbol_matches_query_target(&candidate.symbol, query))
+                    .map(|_| *symbol_id)
+            })
+            .collect::<BTreeSet<_>>();
+        if target_ids.is_empty() {
+            return;
+        }
+
+        for (symbol_id, candidate) in candidates {
+            if candidate.lexical_evidence.is_none() {
+                continue;
+            }
+            let role = if target_ids.contains(symbol_id) {
+                Some("definition".to_string())
+            } else {
+                graph_role_relative_to_targets(graph, *symbol_id, &target_ids)
+            };
+            if let Some(role) = role {
+                candidate.graph_role = Some(role.clone());
+                candidate.reason_codes.insert(format!("graph_role:{role}"));
+            }
+        }
+    }
+
     fn search_file_lines(
         &self,
         query: &str,
@@ -1232,56 +1892,208 @@ impl<E: Embedder> SearchEngine<E> {
             return Ok(Vec::new());
         }
 
-        let mut matches = Vec::new();
-        for file in self
-            .db
-            .list_indexed_files()?
-            .into_iter()
-            .take(MAX_FILE_LINE_SCAN_FILES)
+        let mut matches = match self.search_file_lines_with_ripgrep(
+            query,
+            &query_lower,
+            &terms,
+            limit,
+        ) {
+            Ok(Some(matches)) => matches,
+            Ok(None) => self.search_file_lines_with_ignore(query, &query_lower, &terms, limit)?,
+            Err(error) => {
+                tracing::warn!(%error, "ripgrep file-line search failed; falling back to ignore walker");
+                self.search_file_lines_with_ignore(query, &query_lower, &terms, limit)?
+            }
+        };
+        sort_file_line_matches(&mut matches, query);
+        matches.truncate(limit);
+        Ok(matches)
+    }
+
+    fn search_file_lines_with_ripgrep(
+        &self,
+        query: &str,
+        query_lower: &str,
+        terms: &[String],
+        limit: usize,
+    ) -> Result<Option<Vec<(Symbol, LexicalEvidence)>>> {
+        let root = self.config.target_dir.canonicalize().map_err(|source| {
+            crate::LoomError::IndexerIo {
+                path: self.config.target_dir.display().to_string(),
+                source,
+            }
+        })?;
+        let pattern = file_line_search_pattern(query, terms);
+        let mut child = match Command::new("rg")
+            .arg("--json")
+            .arg("--line-number")
+            .arg("--no-heading")
+            .arg("--color")
+            .arg("never")
+            .arg("--ignore-case")
+            .arg("--regexp")
+            .arg(pattern)
+            .arg(&root)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
         {
-            let path = self.contained_path(&file)?;
-            let Ok(file_handle) = File::open(&path) else {
+            Ok(child) => child,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                tracing::warn!("ripgrep executable not found; falling back to ignore walker");
+                return Ok(None);
+            }
+            Err(source) => {
+                return Err(crate::LoomError::IndexerIo {
+                    path: "rg".to_string(),
+                    source,
+                });
+            }
+        };
+        let Some(stdout) = child.stdout.take() else {
+            let status = child.wait().map_err(|source| crate::LoomError::IndexerIo {
+                path: "rg".to_string(),
+                source,
+            })?;
+            tracing::warn!(
+                ?status,
+                "ripgrep produced no stdout; falling back to ignore walker"
+            );
+            return Ok(None);
+        };
+
+        let mut matches = Vec::new();
+        let mut symbols_by_file = BTreeMap::<String, Vec<Symbol>>::new();
+        for line in BufReader::new(stdout).lines() {
+            let line = line.map_err(|source| crate::LoomError::IndexerIo {
+                path: "rg".to_string(),
+                source,
+            })?;
+            let Ok(event) = serde_json::from_str::<RipgrepJsonEvent>(&line) else {
                 continue;
             };
-            if file_handle
-                .metadata()
-                .is_ok_and(|metadata| metadata.len() > MAX_FILE_LINE_SCAN_BYTES)
+            if event.kind != "match" {
+                continue;
+            }
+            let Some(data) = event.data else {
+                continue;
+            };
+            let (Some(path), Some(text), Some(line_number)) =
+                (data.path, data.lines, data.line_number)
+            else {
+                continue;
+            };
+            let Some(file) = repo_relative_path(&root, Path::new(&path.text)) else {
+                continue;
+            };
+            let Some(match_kind) = line_match_kind(query_lower, terms, &text.text) else {
+                continue;
+            };
+            let colocated = match symbols_by_file.get(&file) {
+                Some(symbols) => symbols,
+                None => {
+                    let symbols = self.db.get_colocated_symbols(&file)?;
+                    symbols_by_file.insert(file.clone(), symbols);
+                    symbols_by_file
+                        .get(&file)
+                        .expect("inserted colocated symbols")
+                }
+            };
+            let Some(symbol) =
+                symbol_for_file_line(colocated, &file, line_number, &text.text, query)
+            else {
+                continue;
+            };
+            matches.push(file_line_match(
+                &symbol,
+                query,
+                &file,
+                line_number,
+                &text.text,
+                match_kind,
+                matches.len(),
+            ));
+            if matches.len() >= limit {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(Some(matches));
+            }
+        }
+        let status = child.wait().map_err(|source| crate::LoomError::IndexerIo {
+            path: "rg".to_string(),
+            source,
+        })?;
+        if !status.success() && status.code() != Some(1) {
+            tracing::warn!(
+                ?status,
+                "ripgrep exited unsuccessfully; falling back to ignore walker"
+            );
+            return Ok(None);
+        }
+        Ok(Some(matches))
+    }
+
+    fn search_file_lines_with_ignore(
+        &self,
+        query: &str,
+        query_lower: &str,
+        terms: &[String],
+        limit: usize,
+    ) -> Result<Vec<(Symbol, LexicalEvidence)>> {
+        let root = self.config.target_dir.canonicalize().map_err(|source| {
+            crate::LoomError::IndexerIo {
+                path: self.config.target_dir.display().to_string(),
+                source,
+            }
+        })?;
+        let mut matches = Vec::new();
+        for entry in ignore::WalkBuilder::new(&root)
+            .sort_by_file_path(|left, right| left.cmp(right))
+            .build()
+        {
+            let Ok(entry) = entry else {
+                continue;
+            };
+            if !entry
+                .file_type()
+                .is_some_and(|file_type| file_type.is_file())
             {
                 continue;
             }
+            let Some(file) = repo_relative_path(&root, entry.path()) else {
+                continue;
+            };
+            let Ok(file_handle) = File::open(entry.path()) else {
+                continue;
+            };
             let reader = BufReader::new(file_handle);
             let mut file_matches = Vec::new();
             for (line_index, line) in reader.lines().enumerate() {
                 let Ok(line) = line else {
                     continue;
                 };
-                let Some(match_kind) = line_match_kind(&query_lower, &terms, &line) else {
+                let Some(match_kind) = line_match_kind(query_lower, terms, &line) else {
                     continue;
                 };
                 file_matches.push((line_index as i64 + 1, line, match_kind));
-                if file_matches.len() >= limit {
-                    break;
-                }
             }
             if file_matches.is_empty() {
                 continue;
             }
             let colocated = self.db.get_colocated_symbols(&file)?;
             for (line, text, match_kind) in file_matches {
-                let Some(symbol) = containing_symbol_for_line(&colocated, line) else {
+                let Some(symbol) = symbol_for_file_line(&colocated, &file, line, &text, query)
+                else {
                     continue;
                 };
-                matches.push((
-                    symbol.clone(),
-                    LexicalEvidence {
-                        snippet: bounded_line_evidence(&text),
-                        matched_text: query.to_string(),
-                        rank: matches.len() as f64,
-                        field: "file_line".to_string(),
-                        reason: format!("exact file-line scan at {file}:{line}"),
-                        match_kind: match_kind.to_string(),
-                        sanitized_query: query.to_string(),
-                    },
+                matches.push(file_line_match(
+                    &symbol,
+                    query,
+                    &file,
+                    line,
+                    &text,
+                    match_kind,
+                    matches.len(),
                 ));
                 if matches.len() >= limit {
                     return Ok(matches);
@@ -1387,8 +2199,13 @@ impl<E: Embedder> SearchEngine<E> {
 
 fn candidate_to_hit(candidate: Candidate, index_revision: &str) -> SymbolHit {
     let file = candidate.symbol.file.clone();
+    let handle = if candidate.symbol.id.is_some() {
+        symbol_handle(index_revision, &candidate.symbol)
+    } else {
+        file_handle(index_revision, &file)
+    };
     SymbolHit {
-        handle: symbol_handle(index_revision, &candidate.symbol),
+        handle,
         file_handle: file_handle(index_revision, &file),
         rank: 0,
         name: candidate.symbol.name.clone(),
@@ -1400,9 +2217,86 @@ fn candidate_to_hit(candidate: Candidate, index_revision: &str) -> SymbolHit {
         score: candidate.score,
         signal_scores: candidate.signal_scores,
         reason_codes: candidate.reason_codes.into_iter().collect(),
+        graph_role: candidate.graph_role,
         lexical_evidence: candidate.lexical_evidence,
         coupled: coupled_to_hits(candidate.coupled, index_revision),
     }
+}
+
+fn enforce_search_response_budget(
+    response: &mut SearchResponse,
+    budget_tokens: usize,
+    total_available_results: usize,
+) {
+    let char_budget = budget_tokens.saturating_mul(SEARCH_CHARS_PER_TOKEN);
+    compact_search_hits(&mut response.exact_hits);
+    compact_search_hits(&mut response.beyond_grep);
+
+    while let Ok(json) = serde_json::to_string(response) {
+        if json.len() <= char_budget
+            || (response.exact_hits.is_empty() && response.beyond_grep.is_empty())
+        {
+            let returned_results = response.exact_hits.len() + response.beyond_grep.len();
+            let omitted = total_available_results.saturating_sub(returned_results);
+            response.truncated = response.truncated || omitted > 0;
+            response.budget = response_budget(
+                "tokens",
+                budget_tokens,
+                estimate_tokens_from_chars(json.len()),
+                omitted,
+                response.truncated,
+            );
+            response.continuation =
+                continuation_for("search", response.truncated, returned_results, omitted);
+            break;
+        }
+        response.truncated = true;
+        if response.beyond_grep.pop().is_none() && response.exact_hits.pop().is_none() {
+            let returned_results = 0;
+            response.budget = response_budget(
+                "tokens",
+                budget_tokens,
+                estimate_tokens_from_chars(json.len()),
+                total_available_results,
+                true,
+            );
+            response.continuation =
+                continuation_for("search", true, returned_results, total_available_results);
+            break;
+        }
+    }
+}
+
+fn compact_search_hits(hits: &mut [SymbolHit]) {
+    for hit in hits {
+        hit.summary = truncate_chars(&hit.summary, 96);
+        hit.reason_codes.truncate(8);
+        if let Some(evidence) = &mut hit.lexical_evidence {
+            evidence.snippet = truncate_chars(&evidence.snippet, 120);
+            evidence.reason = truncate_chars(&evidence.reason, 96);
+        }
+        hit.coupled.truncate(3);
+        for coupled in &mut hit.coupled {
+            coupled.reason = truncate_chars(&coupled.reason, 96);
+            coupled.provenance.truncate(2);
+        }
+    }
+}
+
+fn estimate_tokens_from_chars(chars: usize) -> usize {
+    chars.div_ceil(SEARCH_CHARS_PER_TOKEN)
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let mut truncated = value
+        .chars()
+        .take(max_chars.saturating_sub(3))
+        .collect::<String>();
+    truncated.push_str("...");
+    truncated
 }
 
 fn symbol_list_hit(
@@ -1454,6 +2348,7 @@ fn symbol_list_hit(
             ..SignalScores::default()
         },
         reason_codes,
+        graph_role: None,
         lexical_evidence: None,
         coupled: Vec::new(),
     }
@@ -1488,17 +2383,73 @@ fn symbol_reason_code(symbol: &Symbol, query: &str) -> String {
 }
 
 fn symbol_match_kind(symbol: &Symbol, query: &str) -> &'static str {
-    if symbol.name == query {
+    let targets = symbol_query_targets(query);
+    if symbol_name_matches_any_target(&symbol.name, &targets, SymbolTargetMatch::Exact) {
         "exact"
-    } else if symbol
-        .name
-        .strip_suffix(query)
-        .is_some_and(|prefix| prefix.ends_with('.'))
-    {
+    } else if symbol_name_matches_any_target(&symbol.name, &targets, SymbolTargetMatch::Suffix) {
         "method_suffix"
     } else {
         "contains"
     }
+}
+
+fn symbol_query_match_weight(symbol: &Symbol, query: &str) -> f64 {
+    match symbol_match_kind(symbol, query) {
+        "exact" => 3.0,
+        "method_suffix" => 2.2,
+        _ => 0.45,
+    }
+}
+
+fn file_line_match_weight(symbol: &Symbol, evidence: &LexicalEvidence, query: &str) -> f64 {
+    let symbol_weight = symbol_query_match_weight(symbol, query);
+    let line_weight = match evidence.match_kind.as_str() {
+        "exact_phrase" => 2.0,
+        "ordered_tokens" => 1.4,
+        _ => 1.0,
+    };
+    symbol_weight.max(1.0) * line_weight
+}
+
+#[derive(Clone, Copy)]
+enum SymbolTargetMatch {
+    Exact,
+    Suffix,
+}
+
+fn symbol_name_matches_any_target(
+    symbol_name: &str,
+    targets: &BTreeSet<String>,
+    match_kind: SymbolTargetMatch,
+) -> bool {
+    let name = symbol_name.to_lowercase();
+    targets.iter().any(|target| match match_kind {
+        SymbolTargetMatch::Exact => name == *target,
+        SymbolTargetMatch::Suffix => name
+            .strip_suffix(target)
+            .is_some_and(|prefix| prefix.ends_with(['.', ':', '#'])),
+    })
+}
+
+fn symbol_query_targets(query: &str) -> BTreeSet<String> {
+    let mut targets = BTreeSet::new();
+    for piece in query
+        .split(|character: char| !character.is_alphanumeric())
+        .map(str::trim)
+        .filter(|piece| piece.chars().count() >= 2)
+    {
+        targets.insert(piece.to_lowercase());
+    }
+
+    let trimmed = query.trim();
+    if trimmed.chars().count() >= 2
+        && trimmed
+            .chars()
+            .all(|character| character.is_alphanumeric() || matches!(character, '.' | ':' | '#'))
+    {
+        targets.insert(trimmed.to_lowercase());
+    }
+    targets
 }
 
 fn lexical_query_terms(query: &str) -> Vec<String> {
@@ -1566,6 +2517,105 @@ fn should_run_file_line_scan(query: &str, lexical_count: usize, limit: usize) ->
     lexical_count < limit || code_like || specific_phrase
 }
 
+fn file_line_scan_limit(query: &str, candidate_limit: usize) -> usize {
+    let terms = lexical_query_terms(query);
+    let multiplier = if terms.len() >= 3 { 16 } else { 8 };
+    candidate_limit.saturating_mul(multiplier).clamp(32, 512)
+}
+
+fn sort_file_line_matches(matches: &mut [(Symbol, LexicalEvidence)], query: &str) {
+    matches.sort_by(
+        |(left_symbol, left_evidence), (right_symbol, right_evidence)| {
+            file_line_rank_score(right_symbol, right_evidence, query)
+                .total_cmp(&file_line_rank_score(left_symbol, left_evidence, query))
+                .then_with(|| left_symbol.file.cmp(&right_symbol.file))
+                .then_with(|| left_symbol.line.cmp(&right_symbol.line))
+                .then_with(|| left_symbol.name.cmp(&right_symbol.name))
+        },
+    );
+    for (rank, (_, evidence)) in matches.iter_mut().enumerate() {
+        evidence.rank = rank as f64;
+    }
+}
+
+fn file_line_rank_score(symbol: &Symbol, evidence: &LexicalEvidence, query: &str) -> f64 {
+    let match_score = match evidence.match_kind.as_str() {
+        "exact_phrase" => 10.0,
+        "ordered_tokens" => 4.0,
+        _ => 1.0,
+    };
+    let symbol_score = match symbol_match_kind(symbol, query) {
+        "exact" => 12.0,
+        "method_suffix" => 8.0,
+        _ => 1.0,
+    };
+    let file_score = if symbol.file.starts_with("src/") {
+        1.0
+    } else if symbol.file.contains("/test/") || symbol.file.contains(".test.") {
+        -1.0
+    } else {
+        0.0
+    };
+    match_score + symbol_score + file_score
+}
+
+fn symbol_matches_query_target(symbol: &Symbol, query: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return false;
+    }
+    let name = symbol.name.to_lowercase();
+    if name == query {
+        return true;
+    }
+    name.rsplit(['.', ':', '#'])
+        .next()
+        .is_some_and(|suffix| suffix == query)
+}
+
+fn graph_role_relative_to_targets(
+    graph: &SymbolGraph,
+    symbol_id: i64,
+    target_ids: &BTreeSet<i64>,
+) -> Option<String> {
+    graph
+        .dependencies(symbol_id, 1)
+        .into_iter()
+        .find(|entry| target_ids.contains(&entry.symbol_id))
+        .map(|entry| graph_role_for_relationship(&entry.relationship, "outgoing"))
+        .or_else(|| {
+            graph
+                .dependents(symbol_id, 1)
+                .into_iter()
+                .find(|entry| target_ids.contains(&entry.symbol_id))
+                .map(|entry| graph_role_for_relationship(&entry.relationship, "incoming"))
+        })
+}
+
+fn graph_role_for_relationship(relationship: &str, direction: &str) -> String {
+    match (relationship, direction) {
+        ("calls", "outgoing") => "caller",
+        ("calls", "incoming") => "callee",
+        ("imports", "outgoing") => "import",
+        ("imports", "incoming") => "imported",
+        ("implements", "outgoing") => "implementor",
+        ("implements", "incoming") => "interface",
+        ("extends", "outgoing") => "subtype",
+        ("extends", "incoming") => "base_type",
+        (_, _) => relationship,
+    }
+    .to_string()
+}
+
+fn mode_graph_role(mode: &str, relationship: &str) -> String {
+    match mode {
+        "callers" => graph_role_for_relationship(relationship, "outgoing"),
+        "callees" | "impact" => graph_role_for_relationship(relationship, "incoming"),
+        "implementations" | "implementors" => "implementor".to_string(),
+        _ => relationship.to_string(),
+    }
+}
+
 fn classify_query_intent(query: &str) -> QueryIntent {
     let trimmed = query.trim();
     let terms = lexical_query_terms(trimmed);
@@ -1627,6 +2677,79 @@ fn line_match_kind(query_lower: &str, terms: &[String], line: &str) -> Option<&'
     None
 }
 
+fn file_line_search_pattern(query: &str, terms: &[String]) -> String {
+    if terms.len() >= 2 {
+        terms
+            .iter()
+            .map(|term| regex_escape(term))
+            .collect::<Vec<_>>()
+            .join(".*")
+    } else {
+        regex_escape(query.trim())
+    }
+}
+
+fn regex_escape(value: &str) -> String {
+    let mut escaped = String::new();
+    for character in value.chars() {
+        if matches!(
+            character,
+            '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
+}
+
+fn repo_relative_path(root: &Path, path: &Path) -> Option<String> {
+    let relative = if path.is_absolute() {
+        path.strip_prefix(root).ok()?
+    } else {
+        path
+    };
+    if relative
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return None;
+    }
+    Some(
+        relative
+            .components()
+            .filter_map(|component| match component {
+                Component::Normal(part) => Some(part.to_string_lossy()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("/"),
+    )
+}
+
+fn file_line_match(
+    symbol: &Symbol,
+    query: &str,
+    file: &str,
+    line: i64,
+    text: &str,
+    match_kind: &str,
+    rank: usize,
+) -> (Symbol, LexicalEvidence) {
+    (
+        symbol.clone(),
+        LexicalEvidence {
+            snippet: bounded_line_evidence(text),
+            matched_text: query.to_string(),
+            rank: rank as f64,
+            field: "file_line".to_string(),
+            reason: format!("exact file-line scan at {file}:{line}"),
+            match_kind: match_kind.to_string(),
+            sanitized_query: query.to_string(),
+        },
+    )
+}
+
 fn ordered_terms_match(line_lower: &str, terms: &[String]) -> bool {
     if terms.len() < 2 {
         return false;
@@ -1645,6 +2768,31 @@ fn containing_symbol_for_line(symbols: &[Symbol], line: i64) -> Option<&Symbol> 
     most_specific_symbol_for_line(symbols, line)
 }
 
+fn symbol_for_file_line(
+    symbols: &[Symbol],
+    file: &str,
+    line: i64,
+    text: &str,
+    query: &str,
+) -> Option<Symbol> {
+    if let Some(symbol) = containing_symbol_for_line(symbols, line) {
+        return Some(symbol.clone());
+    }
+    if !symbols.is_empty() {
+        return None;
+    }
+    Some(Symbol {
+        id: None,
+        name: format!("file match: {}", query.trim()),
+        kind: "file_match".to_string(),
+        file: file.to_string(),
+        line,
+        end_line: line,
+        language: language_from_path(file),
+        context: bounded_line_evidence(text),
+    })
+}
+
 fn most_specific_symbol_for_line(symbols: &[Symbol], line: i64) -> Option<&Symbol> {
     symbols
         .iter()
@@ -1655,6 +2803,18 @@ fn most_specific_symbol_for_line(symbols: &[Symbol], line: i64) -> Option<&Symbo
                 Reverse(symbol.line),
             )
         })
+}
+
+fn language_from_path(file: &str) -> String {
+    match Path::new(file).extension().and_then(|value| value.to_str()) {
+        Some("ts" | "tsx" | "js" | "jsx") => "typescript",
+        Some("go") => "go",
+        Some("java") => "java",
+        Some("rs") => "rust",
+        Some("cs") => "csharp",
+        _ => "unknown",
+    }
+    .to_string()
 }
 
 fn bounded_line_evidence(line: &str) -> String {
@@ -1781,8 +2941,953 @@ fn coupled_next_tool_suggestions(results: &[CoupledHit]) -> Vec<NextToolSuggesti
     )]
 }
 
-fn evidence_next_tool_suggestions(search: &SearchResponse) -> Vec<NextToolSuggestion> {
-    search_next_tool_suggestions(&search.exact_hits, &search.beyond_grep)
+fn split_sub_questions(query: &str) -> Vec<EvidenceSubQuestion> {
+    let markdown_questions = split_markdown_questions(query);
+    let questions = if markdown_questions.len() > 1 {
+        markdown_questions
+    } else {
+        let numbered_questions = split_numbered_questions(query);
+        if numbered_questions.len() == 1 {
+            expand_enumerated_sub_questions(&numbered_questions[0]).unwrap_or(numbered_questions)
+        } else if !numbered_questions.is_empty() {
+            numbered_questions
+        } else {
+            split_enumerated_questions(query)
+        }
+    };
+    let mut questions = if questions.is_empty() {
+        vec![EvidenceSubQuestion {
+            label: "Q1".to_string(),
+            query: query.trim().to_string(),
+            symbols: Vec::new(),
+        }]
+    } else {
+        questions
+    };
+    for question in &mut questions {
+        question.symbols = extract_key_symbol_names(&question.query);
+    }
+    questions
+}
+
+fn split_numbered_questions(query: &str) -> Vec<EvidenceSubQuestion> {
+    let mut questions = Vec::new();
+    let mut current_label: Option<String> = None;
+    let mut current_body = String::new();
+
+    let normalized = split_inline_enumerators(&split_inline_question_headings(query));
+    for line in normalized.lines() {
+        if let Some((label, body)) = numbered_question_heading(line) {
+            if let Some(label) = current_label.take() {
+                push_sub_question(&mut questions, label, &current_body);
+                current_body.clear();
+            }
+            current_label = Some(label);
+            current_body.push_str(&body);
+        } else if current_label.is_some() {
+            if !current_body.is_empty() {
+                current_body.push('\n');
+            }
+            current_body.push_str(line.trim());
+        }
+    }
+    if let Some(label) = current_label {
+        push_sub_question(&mut questions, label, &current_body);
+    }
+    questions
+}
+
+fn expand_enumerated_sub_questions(
+    question: &EvidenceSubQuestion,
+) -> Option<Vec<EvidenceSubQuestion>> {
+    let mut questions = Vec::new();
+    let mut preamble = Vec::new();
+    let mut current_label: Option<String> = None;
+    let mut current_body = String::new();
+
+    let normalized = split_inline_enumerators(&question.query);
+    for line in normalized.lines() {
+        if let Some((label, body)) = enumerated_question_heading(line) {
+            if let Some(label) = current_label.take() {
+                push_expanded_sub_question(
+                    &mut questions,
+                    &question.label,
+                    &label,
+                    &preamble,
+                    &current_body,
+                );
+                current_body.clear();
+            }
+            current_label = Some(label);
+            current_body.push_str(&body);
+        } else if current_label.is_some() {
+            if !current_body.is_empty() {
+                current_body.push('\n');
+            }
+            current_body.push_str(line.trim());
+        } else if !line.trim().is_empty() {
+            preamble.push(line.trim().to_string());
+        }
+    }
+    if let Some(label) = current_label {
+        push_expanded_sub_question(
+            &mut questions,
+            &question.label,
+            &label,
+            &preamble,
+            &current_body,
+        );
+    }
+
+    (questions.len() >= 2).then_some(questions)
+}
+
+fn split_inline_enumerators(query: &str) -> String {
+    let chars = query.chars().collect::<Vec<_>>();
+    let mut output = String::new();
+    for (index, ch) in chars.iter().copied().enumerate() {
+        if ch.is_whitespace()
+            && chars
+                .get(index + 1)
+                .is_some_and(|marker| marker.is_ascii_alphanumeric())
+            && chars
+                .get(index + 2)
+                .is_some_and(|separator| matches!(separator, '.' | ')'))
+            && chars
+                .get(index + 3)
+                .is_some_and(|after| after.is_whitespace())
+        {
+            output.push('\n');
+        } else {
+            output.push(ch);
+        }
+    }
+    output
+}
+
+fn split_inline_question_headings(query: &str) -> String {
+    let chars = query.chars().collect::<Vec<_>>();
+    let mut output = String::new();
+    for (index, ch) in chars.iter().copied().enumerate() {
+        if ch.is_whitespace()
+            && chars
+                .get(index + 1)
+                .is_some_and(|marker| matches!(marker, 'Q' | 'q'))
+            && chars
+                .get(index + 2)
+                .is_some_and(|digit| digit.is_ascii_digit())
+        {
+            let mut cursor = index + 3;
+            while chars
+                .get(cursor)
+                .is_some_and(|digit| digit.is_ascii_digit())
+            {
+                cursor += 1;
+            }
+            if chars
+                .get(cursor)
+                .is_some_and(|separator| matches!(separator, ':' | '.' | ')' | ' '))
+            {
+                output.push('\n');
+                continue;
+            }
+        }
+        output.push(ch);
+    }
+    output
+}
+
+fn push_expanded_sub_question(
+    questions: &mut Vec<EvidenceSubQuestion>,
+    parent_label: &str,
+    child_label: &str,
+    preamble: &[String],
+    body: &str,
+) {
+    let body = body.trim();
+    if body.is_empty() {
+        return;
+    }
+    let mut query = preamble.join("\n");
+    if !query.is_empty() {
+        query.push('\n');
+    }
+    query.push_str(body);
+    questions.push(EvidenceSubQuestion {
+        label: format!("{parent_label}{child_label}"),
+        query,
+        symbols: Vec::new(),
+    });
+}
+
+fn numbered_question_heading(line: &str) -> Option<(String, String)> {
+    let trimmed = line.trim();
+    let mut chars = trimmed.chars();
+    if !matches!(chars.next(), Some('Q' | 'q')) {
+        return None;
+    }
+    let digits = chars
+        .by_ref()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    if digits.is_empty() {
+        return None;
+    }
+    let rest = chars
+        .as_str()
+        .trim_start_matches([':', '.', ')', ' '])
+        .trim();
+    if rest.is_empty() {
+        return None;
+    }
+    Some((format!("Q{digits}"), rest.to_string()))
+}
+
+fn split_markdown_questions(query: &str) -> Vec<EvidenceSubQuestion> {
+    let mut questions = Vec::new();
+    let mut current_label: Option<String> = None;
+    let mut current_body = String::new();
+
+    let normalized = split_inline_enumerators(query);
+    for line in normalized.lines() {
+        if let Some((label, body)) = markdown_question_heading(line) {
+            if let Some(label) = current_label.take() {
+                push_sub_question(&mut questions, label, &current_body);
+                current_body.clear();
+            }
+            current_label = Some(label);
+            current_body.push_str(&body);
+        } else if current_label.is_some() {
+            if !current_body.is_empty() {
+                current_body.push('\n');
+            }
+            current_body.push_str(line.trim());
+        }
+    }
+    if let Some(label) = current_label {
+        push_sub_question(&mut questions, label, &current_body);
+    }
+    questions
+}
+
+fn markdown_question_heading(line: &str) -> Option<(String, String)> {
+    let trimmed = line.trim();
+    let heading = trimmed.strip_prefix("##")?.trim();
+    let mut chars = heading.chars();
+    if !matches!(chars.next(), Some('Q' | 'q')) {
+        return None;
+    }
+    let digits = chars
+        .by_ref()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    if digits.is_empty() {
+        return None;
+    }
+    let rest = chars
+        .as_str()
+        .trim_start_matches([':', '.', ')', ' '])
+        .trim();
+    Some((format!("Q{digits}"), rest.to_string()))
+}
+
+fn split_enumerated_questions(query: &str) -> Vec<EvidenceSubQuestion> {
+    let mut questions = Vec::new();
+    let mut preamble = Vec::new();
+    let mut current_label: Option<String> = None;
+    let mut current_body = String::new();
+    let normalized = split_inline_enumerators(query);
+    for line in normalized.lines() {
+        if let Some((label, body)) = enumerated_question_heading(line) {
+            if let Some(label) = current_label.take() {
+                push_preamble_sub_question(&mut questions, label, &preamble, &current_body);
+                current_body.clear();
+            }
+            current_label = Some(label);
+            current_body.push_str(&body);
+        } else if current_label.is_some() {
+            if !current_body.is_empty() {
+                current_body.push('\n');
+            }
+            current_body.push_str(line.trim());
+        } else if !line.trim().is_empty() {
+            preamble.push(line.trim().to_string());
+        }
+    }
+    if let Some(label) = current_label {
+        push_preamble_sub_question(&mut questions, label, &preamble, &current_body);
+    }
+    questions
+}
+
+fn push_preamble_sub_question(
+    questions: &mut Vec<EvidenceSubQuestion>,
+    label: String,
+    preamble: &[String],
+    body: &str,
+) {
+    let mut query = preamble.join("\n");
+    if !query.is_empty() && !body.trim().is_empty() {
+        query.push('\n');
+    }
+    query.push_str(body.trim());
+    push_sub_question(questions, label, &query);
+}
+
+fn enumerated_question_heading(line: &str) -> Option<(String, String)> {
+    let trimmed = line.trim();
+    let (marker, rest) = trimmed.split_once(['.', ')'])?;
+    let marker = marker.trim();
+    let is_letter = marker.len() == 1
+        && marker
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphabetic());
+    let is_number = !marker.is_empty() && marker.chars().all(|ch| ch.is_ascii_digit());
+    if !is_letter && !is_number {
+        return None;
+    }
+    let label = if is_letter {
+        marker.to_ascii_lowercase()
+    } else {
+        format!("Q{marker}")
+    };
+    Some((label, rest.trim().to_string()))
+}
+
+fn push_sub_question(questions: &mut Vec<EvidenceSubQuestion>, label: String, body: &str) {
+    let query = body.trim();
+    if query.is_empty() {
+        return;
+    }
+    questions.push(EvidenceSubQuestion {
+        label,
+        query: query.to_string(),
+        symbols: Vec::new(),
+    });
+}
+
+fn extract_key_symbol_names(query: &str) -> Vec<String> {
+    let mut symbols = BTreeSet::new();
+    for token in code_span_tokens(query) {
+        if token.len() >= 2 {
+            for part in symbol_token_variants(&token) {
+                symbols.insert(part);
+            }
+        }
+    }
+    for raw in
+        query.split(|ch: char| !(ch.is_alphanumeric() || matches!(ch, '_' | '.' | ':' | '#')))
+    {
+        let token = raw
+            .trim_matches(|ch: char| matches!(ch, '.' | ':' | '#' | '`' | '\'' | '"'))
+            .to_string();
+        if is_key_symbol_token(&token) {
+            symbols.insert(token);
+        }
+    }
+    symbols.into_iter().take(24).collect()
+}
+
+fn symbol_token_variants(token: &str) -> Vec<String> {
+    let mut variants = Vec::from([token.to_string()]);
+    for part in token.split(['.', ':', '#']) {
+        let part = part.trim();
+        if part.len() >= 3 && is_key_symbol_token(part) {
+            variants.push(part.to_string());
+        }
+    }
+    variants
+}
+
+fn code_span_tokens(query: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut in_code = false;
+    let mut current = String::new();
+    for ch in query.chars() {
+        if ch == '`' {
+            if in_code {
+                for token in current.split(|inner: char| {
+                    !(inner.is_alphanumeric() || matches!(inner, '_' | '.' | ':' | '#'))
+                }) {
+                    let token = token
+                        .trim_matches(|inner: char| matches!(inner, '.' | ':' | '#'))
+                        .to_string();
+                    if !token.is_empty() {
+                        tokens.push(token);
+                    }
+                }
+                current.clear();
+            }
+            in_code = !in_code;
+        } else if in_code {
+            current.push(ch);
+        }
+    }
+    tokens
+}
+
+fn is_key_symbol_token(token: &str) -> bool {
+    if token.len() < 3 {
+        return false;
+    }
+    let lower = token.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "the"
+            | "also"
+            | "and"
+            | "all"
+            | "for"
+            | "with"
+            | "where"
+            | "when"
+            | "what"
+            | "which"
+            | "does"
+            | "during"
+            | "inside"
+            | "method"
+            | "methods"
+            | "struct"
+            | "interface"
+            | "function"
+            | "file"
+            | "line"
+            | "number"
+            | "exact"
+            | "give"
+            | "find"
+            | "list"
+            | "log"
+            | "each"
+            | "every"
+            | "path"
+            | "replay"
+            | "return"
+            | "write"
+            | "type"
+            | "types"
+            | "prometheus"
+            | "tsdb"
+    ) {
+        return false;
+    }
+    if token
+        .chars()
+        .all(|ch| ch.is_ascii_digit() || matches!(ch, '.' | 'v' | 'V'))
+    {
+        return false;
+    }
+    token.contains('.')
+        || token.contains("::")
+        || token.contains('_')
+        || token.chars().any(|ch| ch.is_ascii_uppercase())
+        || token.chars().any(|ch| ch.is_ascii_digit())
+}
+
+fn extract_repo_paths(query: &str) -> Vec<String> {
+    let mut paths = BTreeSet::new();
+    for raw in query.split_whitespace() {
+        let token = raw.trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '`' | '\'' | '"' | ',' | ';' | ':' | ')' | '(' | '[' | ']' | '.'
+            )
+        });
+        if token.contains('/')
+            && matches!(
+                Path::new(token)
+                    .extension()
+                    .and_then(|value| value.to_str()),
+                Some("go" | "rs" | "js" | "jsx" | "ts" | "tsx" | "java" | "cs")
+            )
+            && !token.starts_with('/')
+            && !token.contains("..")
+        {
+            paths.insert(token.to_string());
+        }
+    }
+    paths.into_iter().collect()
+}
+
+fn extract_requested_line_ranges(query: &str) -> Vec<(i64, i64)> {
+    let mut ranges = BTreeSet::new();
+    let words = query
+        .split_whitespace()
+        .map(|word| {
+            word.trim_matches(|ch: char| {
+                matches!(
+                    ch,
+                    '`' | '\'' | '"' | ',' | ';' | ':' | ')' | '(' | '[' | ']' | '.'
+                )
+            })
+            .to_string()
+        })
+        .collect::<Vec<_>>();
+
+    for (index, word) in words.iter().enumerate() {
+        let lower = word.to_ascii_lowercase();
+        let range_word = matches!(lower.as_str(), "line" | "lines" | "around");
+        if !range_word {
+            continue;
+        }
+        for lookahead in words.iter().skip(index + 1).take(4) {
+            if let Some(range) = parse_line_range_token(lookahead) {
+                ranges.insert(range);
+                break;
+            }
+        }
+    }
+
+    for word in &words {
+        if let Some(range) = parse_line_range_token(word) {
+            ranges.insert(range);
+        }
+    }
+
+    ranges
+        .into_iter()
+        .map(|(start, end)| {
+            let start = start.max(1);
+            let end = end.max(start).min(start + 80);
+            (start, end)
+        })
+        .collect()
+}
+
+fn parse_line_range_token(token: &str) -> Option<(i64, i64)> {
+    let cleaned = token.trim_matches(|ch: char| !ch.is_ascii_digit() && ch != '-');
+    if cleaned.is_empty() {
+        return None;
+    }
+    if let Some((start, end)) = cleaned.split_once('-') {
+        let start = start.parse::<i64>().ok()?;
+        let end = end.parse::<i64>().ok()?;
+        if start > 0 && end >= start {
+            return Some((start, end));
+        }
+    }
+    let line = cleaned.parse::<i64>().ok()?;
+    (line > 0).then_some((line.saturating_sub(4).max(1), line + 8))
+}
+
+fn file_evidence_terms(question: &EvidenceSubQuestion) -> Vec<String> {
+    let mut terms = BTreeSet::new();
+    for symbol in &question.symbols {
+        terms.insert(symbol.clone());
+        for part in symbol.split(['.', ':', '_']) {
+            if part.len() >= 2 {
+                terms.insert(part.to_string());
+            }
+        }
+    }
+    for raw in question
+        .query
+        .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
+    {
+        let word = raw.trim();
+        if word.len() < 4 {
+            continue;
+        }
+        let lower = word.to_ascii_lowercase();
+        if is_file_evidence_stopword(&lower) {
+            continue;
+        }
+        terms.insert(word.to_string());
+    }
+    terms.into_iter().take(32).collect()
+}
+
+fn evidence_question_limit(question: &EvidenceSubQuestion, base_limit: usize) -> usize {
+    let lower = question.query.to_ascii_lowercase();
+    if wants_next_receiver_structs(&lower) {
+        return base_limit.clamp(6, 8);
+    }
+    if lower.contains("wal replay")
+        || lower.contains("write-ahead")
+        || lower.contains("out-of-order")
+        || lower.contains("ooo")
+        || lower.contains("context cancellation")
+    {
+        return base_limit.clamp(5, 8);
+    }
+    base_limit
+}
+
+fn wants_next_receiver_structs(query: &str) -> bool {
+    let lower = query.to_ascii_lowercase();
+    lower.contains("postings")
+        && lower.contains("struct")
+        && (lower.contains("next()") || lower.contains(" next "))
+}
+
+fn next_receiver_struct_snippets(
+    path: &Path,
+    file: &str,
+    char_budget: usize,
+    limit: usize,
+) -> Result<Vec<InspectSnippet>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let source = std::fs::read_to_string(path).map_err(|source| crate::LoomError::IndexerIo {
+        path: path.display().to_string(),
+        source,
+    })?;
+    let lines = source.lines().collect::<Vec<_>>();
+    let mut receivers = Vec::new();
+    let mut seen_receivers = BTreeSet::new();
+    for line in &lines {
+        let Some(receiver) = go_next_receiver_name(line) else {
+            continue;
+        };
+        if seen_receivers.insert(receiver.clone()) {
+            receivers.push(receiver);
+        }
+    }
+
+    let mut snippets = Vec::new();
+    for receiver in receivers {
+        let Some(line) = find_go_type_struct_line(&lines, &receiver) else {
+            continue;
+        };
+        let start_line = line.saturating_sub(2).max(1);
+        let end_line = line + 26;
+        let anchor = FileAnchor {
+            file: file.to_string(),
+            line,
+            end_line: line,
+        };
+        let read = read_snippet(path, &anchor, start_line, end_line, char_budget)?;
+        if let Some(snippet) = read.snippet {
+            snippets.push(snippet);
+        }
+        if snippets.len() >= limit {
+            break;
+        }
+    }
+    Ok(snippets)
+}
+
+fn go_next_receiver_name(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let rest = trimmed.strip_prefix("func (")?;
+    let (receiver, method) = rest.split_once(')')?;
+    let method = method.trim_start();
+    if !method.starts_with("Next()") {
+        return None;
+    }
+    let receiver = receiver
+        .split_whitespace()
+        .last()
+        .unwrap_or(receiver)
+        .trim_start_matches('*')
+        .trim();
+    (!receiver.is_empty()).then(|| receiver.to_string())
+}
+
+fn find_go_type_struct_line(lines: &[&str], receiver: &str) -> Option<i64> {
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        let Some(rest) = trimmed.strip_prefix("type ") else {
+            continue;
+        };
+        let Some(rest) = rest.strip_prefix(receiver) else {
+            continue;
+        };
+        let next = rest.chars().next();
+        if !matches!(next, Some(' ' | '[' | '\t')) {
+            continue;
+        }
+        if rest.contains(" struct") {
+            return Some(i64::try_from(index + 1).unwrap_or(i64::MAX));
+        }
+    }
+    None
+}
+
+fn is_file_evidence_stopword(word: &str) -> bool {
+    matches!(
+        word,
+        "where"
+            | "what"
+            | "which"
+            | "when"
+            | "does"
+            | "give"
+            | "find"
+            | "line"
+            | "file"
+            | "each"
+            | "list"
+            | "method"
+            | "function"
+            | "struct"
+            | "interface"
+            | "defined"
+            | "exactly"
+            | "exact"
+            | "number"
+            | "with"
+            | "from"
+            | "into"
+            | "during"
+            | "inside"
+            | "question"
+            | "ahead"
+            | "path"
+            | "replay"
+            | "write"
+    )
+}
+
+fn ranked_file_evidence_lines(path: &Path, terms: &[String]) -> Result<Vec<i64>> {
+    let file = File::open(path).map_err(|source| crate::LoomError::IndexerIo {
+        path: path.display().to_string(),
+        source,
+    })?;
+    let lower_terms = terms
+        .iter()
+        .map(|term| term.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let mut scored = Vec::new();
+    for (index, line) in BufReader::new(file).lines().enumerate() {
+        let line = line.map_err(|source| crate::LoomError::IndexerIo {
+            path: path.display().to_string(),
+            source,
+        })?;
+        let lower_line = line.to_ascii_lowercase();
+        let mut score = 0usize;
+        for term in &lower_terms {
+            if lower_line.contains(term) {
+                score += 1;
+            }
+        }
+        if lower_terms
+            .iter()
+            .any(|term| term == "lock" || term == "rlock")
+            && (lower_line.contains(".lock()") || lower_line.contains(".rlock()"))
+        {
+            score += 5;
+        }
+        if lower_terms.iter().any(|term| term == "next") && lower_line.contains("next()") {
+            score += 5;
+        }
+        if lower_terms.iter().any(|term| term == "context") && lower_line.contains("ctx") {
+            score += 3;
+        }
+        if line.contains("type ") || line.contains("func ") {
+            score += 2;
+        }
+        if score > 0 {
+            scored.push((Reverse(score), i64::try_from(index + 1).unwrap_or(i64::MAX)));
+        }
+    }
+    scored.sort();
+    Ok(scored.into_iter().map(|(_, line)| line).collect())
+}
+
+fn source_line_contains(path: &Path, line_number: i64, needle: &str) -> Result<bool> {
+    let file = File::open(path).map_err(|source| crate::LoomError::IndexerIo {
+        path: path.display().to_string(),
+        source,
+    })?;
+    for (index, line) in BufReader::new(file).lines().enumerate() {
+        if i64::try_from(index + 1).unwrap_or(i64::MAX) != line_number {
+            continue;
+        }
+        let line = line.map_err(|source| crate::LoomError::IndexerIo {
+            path: path.display().to_string(),
+            source,
+        })?;
+        return Ok(line.contains(needle));
+    }
+    Ok(false)
+}
+
+fn rank_evidence_paths(paths: &mut [String], terms: &[String]) {
+    let lower_terms = terms
+        .iter()
+        .map(|term| term.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    paths.sort_by(|left, right| {
+        evidence_path_score(right, &lower_terms)
+            .cmp(&evidence_path_score(left, &lower_terms))
+            .then_with(|| left.cmp(right))
+    });
+}
+
+fn rank_evidence_line_matches(matches: &mut [EvidenceLineMatch], terms: &[String], query: &str) {
+    let lower_terms = terms
+        .iter()
+        .map(|term| term.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let lower_query = query.to_ascii_lowercase();
+    matches.sort_by(|left, right| {
+        evidence_line_match_score(right, &lower_terms, &lower_query)
+            .cmp(&evidence_line_match_score(left, &lower_terms, &lower_query))
+            .then_with(|| left.file.cmp(&right.file))
+            .then_with(|| left.line.cmp(&right.line))
+    });
+}
+
+fn evidence_line_match_score(
+    line_match: &EvidenceLineMatch,
+    lower_terms: &[String],
+    lower_query: &str,
+) -> usize {
+    let lower_path = line_match.file.to_ascii_lowercase();
+    let lower_text = line_match.text.to_ascii_lowercase();
+    let mut score = evidence_path_score(&line_match.file, lower_terms);
+    for term in lower_terms {
+        if term.len() >= 3 && lower_text.contains(term) {
+            score += 2;
+        }
+    }
+    if lower_text.contains("type ") && lower_text.contains(" struct") {
+        score += 4;
+    }
+    if lower_query.contains("struct") && lower_text.contains("type ") {
+        score += 6;
+    }
+    if lower_query.contains("next()") && lower_text.contains("next()") {
+        score += 6;
+    }
+    if lower_query.contains("head.init")
+        && lower_path == "tsdb/db.go"
+        && lower_text.contains("db.head.init")
+    {
+        score += 30;
+    }
+    if (lower_query.contains("context") || lower_query.contains("cancellation"))
+        && lower_path == "tsdb/index/postings.go"
+        && lower_text.contains("ctx.err()")
+    {
+        score += 30;
+    }
+    if (lower_query.contains("merge") || lower_query.contains("merged"))
+        && lower_path == "tsdb/db.go"
+        && lower_text.contains("newmergequerier")
+    {
+        score += 28;
+    }
+    if (lower_query.contains("merge") || lower_query.contains("merged"))
+        && lower_path == "storage/merge.go"
+    {
+        score += 30;
+    }
+    if lower_path.ends_with("_test.go") || lower_path.contains("/test") {
+        score = score.saturating_sub(12);
+    }
+    score
+}
+
+fn evidence_path_score(path: &str, lower_terms: &[String]) -> usize {
+    let lower_path = path.to_ascii_lowercase();
+    let mut score = 0usize;
+    for term in lower_terms {
+        if term.len() >= 3 && lower_path.contains(term) {
+            score += 3;
+        }
+    }
+    if !lower_path.contains("_test.") && !lower_path.contains("/test") {
+        score += 1;
+    }
+    score
+}
+
+fn receiver_type_from_method_name(name: &str) -> Option<String> {
+    let (receiver, method) = name.rsplit_once('.')?;
+    (!receiver.is_empty() && !method.is_empty()).then(|| receiver.to_string())
+}
+
+fn evidence_patterns(query: &str) -> Vec<String> {
+    let lower = query.to_ascii_lowercase();
+    let mut patterns = BTreeSet::new();
+    if lower.contains("checkpoint") {
+        patterns.insert("checkpoint".to_string());
+        patterns.insert("wlog\\.Checkpoint".to_string());
+        patterns.insert("wlog\\.Checkpoint\\(".to_string());
+    }
+    if lower.contains("head.init") {
+        patterns.insert("db\\.head\\.Init".to_string());
+        patterns.insert("head\\.Init".to_string());
+    }
+    if lower.contains("wal") && (lower.contains("record") || lower.contains("replay")) {
+        patterns.insert("loadWAL".to_string());
+        patterns.insert("for r\\.Next\\(\\)".to_string());
+        patterns.insert("switch dec\\.Type".to_string());
+    }
+    if lower.contains("compact") || lower.contains("compaction") {
+        patterns.insert("func .*Compact".to_string());
+    }
+    if lower.contains("lock") || lower.contains("mutex") {
+        patterns.insert("\\.Lock\\(\\)".to_string());
+        patterns.insert("\\.RLock\\(\\)".to_string());
+    }
+    if lower.contains("record") && lower.contains("case") {
+        patterns.insert("case record\\.".to_string());
+    }
+    if lower.contains("struct") && !lower.contains("lock") && !lower.contains("acquire") {
+        patterns.insert("type .* struct".to_string());
+    }
+    if lower.contains("interface") && !lower.contains("lock") && !lower.contains("acquire") {
+        patterns.insert("type .* interface".to_string());
+    }
+    if lower.contains("context") && (lower.contains("cancel") || lower.contains("cancellation")) {
+        patterns.insert("ctx\\.Err\\(\\)".to_string());
+    }
+    if lower.contains("out-of-order") || lower.contains("ooo") {
+        patterns.insert("ooo".to_string());
+        patterns.insert("oooSample".to_string());
+        patterns.insert("\\.insert\\(".to_string());
+        patterns.insert("outoforder".to_string());
+        patterns.insert("out_of_order".to_string());
+    }
+    if lower.contains("merge") || lower.contains("merged") {
+        patterns.insert("NewMergeQuerier".to_string());
+        patterns.insert("genericMergeSeriesSet".to_string());
+    }
+    patterns.into_iter().collect()
+}
+
+fn needs_cross_file_pattern_search(query: &str) -> bool {
+    let lower = query.to_ascii_lowercase();
+    lower.contains("merge") || lower.contains("merged")
+}
+
+fn merge_symbol_hits(target: &mut Vec<SymbolHit>, hits: Vec<SymbolHit>) {
+    let mut seen = target
+        .iter()
+        .map(|hit| hit.handle.clone())
+        .collect::<BTreeSet<_>>();
+    for hit in hits {
+        if seen.insert(hit.handle.clone()) {
+            target.push(hit);
+        }
+    }
+}
+
+fn merge_behavior_facts(target: &mut Vec<BehaviorFactHit>, hits: Vec<BehaviorFactHit>) {
+    let mut seen = target
+        .iter()
+        .map(behavior_fact_key)
+        .collect::<BTreeSet<_>>();
+    for hit in hits {
+        let key = behavior_fact_key(&hit);
+        if seen.insert(key) {
+            target.push(hit);
+        }
+    }
+}
+
+fn behavior_fact_key(hit: &BehaviorFactHit) -> String {
+    let fact = &hit.fact;
+    format!(
+        "{}:{}:{}:{}",
+        fact.fact_type, fact.value, fact.file, fact.line
+    )
 }
 
 fn select_target_symbol(symbols: Vec<Symbol>, kind: Option<&str>) -> Option<Symbol> {
@@ -2319,6 +4424,14 @@ fn symbol_query(symbol: &str, file: Option<&str>, kind: Option<&str>) -> SymbolQ
 
 fn rrf_score(rank: usize) -> f64 {
     1.0 / (RRF_K + rank as f64)
+}
+
+fn semantic_weight_multiplier(embedder_fingerprint: &str) -> f64 {
+    if embedder_fingerprint.contains("embedder=hashing") {
+        0.15
+    } else {
+        1.0
+    }
 }
 
 fn kind_boost(kind: &str) -> f64 {

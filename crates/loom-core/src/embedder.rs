@@ -15,7 +15,7 @@ use tokenizers::Tokenizer;
 use tracing::warn;
 
 const REQUIRED_MODEL_FILES: [&str; 3] = ["config.json", "tokenizer.json", "model.safetensors"];
-const MAX_TOKEN_LENGTH: usize = 8_192;
+const MAX_TOKEN_LENGTH: usize = 2_048;
 
 pub trait Embedder: Send + Sync {
     fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
@@ -159,12 +159,9 @@ impl Embedder for HashingEmbedder {
                     actual: 0,
                 });
             }
-            for token in text
-                .split(|character: char| !character.is_alphanumeric() && character != '_')
-                .filter(|token| !token.is_empty())
-            {
+            for token in hashing_tokens(text) {
                 let mut hasher = DefaultHasher::new();
-                token.to_ascii_lowercase().hash(&mut hasher);
+                token.hash(&mut hasher);
                 let index = (hasher.finish() as usize) % self.dimensions;
                 vector[index] += 1.0;
             }
@@ -184,6 +181,93 @@ impl Embedder for HashingEmbedder {
             self.dimensions
         )
     }
+}
+
+fn hashing_tokens(text: &str) -> Vec<String> {
+    text.split(|character: char| !character.is_alphanumeric() && character != '_')
+        .flat_map(split_identifier_token)
+        .filter(|token| !is_hashing_stop_token(token))
+        .collect()
+}
+
+fn split_identifier_token(raw: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut previous_was_lower_or_digit = false;
+    for character in raw.chars() {
+        if character == '_' {
+            push_hash_token(&mut tokens, &mut current);
+            previous_was_lower_or_digit = false;
+            continue;
+        }
+        if character.is_ascii_uppercase() && previous_was_lower_or_digit {
+            push_hash_token(&mut tokens, &mut current);
+        }
+        previous_was_lower_or_digit = character.is_ascii_lowercase() || character.is_ascii_digit();
+        current.push(character.to_ascii_lowercase());
+    }
+    push_hash_token(&mut tokens, &mut current);
+    tokens
+}
+
+fn push_hash_token(tokens: &mut Vec<String>, current: &mut String) {
+    if !current.is_empty() {
+        tokens.push(std::mem::take(current));
+    }
+}
+
+fn is_hashing_stop_token(token: &str) -> bool {
+    const STOP_TOKENS: &[&str] = &[
+        "a",
+        "an",
+        "and",
+        "as",
+        "by",
+        "class",
+        "const",
+        "constructor",
+        "controller",
+        "create",
+        "default",
+        "dispose",
+        "editor",
+        "export",
+        "false",
+        "for",
+        "from",
+        "function",
+        "get",
+        "handle",
+        "if",
+        "impl",
+        "import",
+        "in",
+        "interface",
+        "let",
+        "manager",
+        "new",
+        "of",
+        "on",
+        "private",
+        "provider",
+        "public",
+        "return",
+        "self",
+        "service",
+        "set",
+        "src",
+        "string",
+        "terminal",
+        "this",
+        "to",
+        "true",
+        "type",
+        "update",
+        "var",
+        "void",
+        "with",
+    ];
+    token.len() <= 1 || STOP_TOKENS.contains(&token)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

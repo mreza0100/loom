@@ -1,11 +1,12 @@
 use loom_core::{
     embedder::Embedder,
+    graph::SymbolGraph,
     indexer::{index_fingerprint, IndexPipeline},
     store::LoomDb,
-    LoomConfig, LoomError, Result, VectorBackendConfig,
+    LoomConfig, LoomError, Result, SearchEngine, VectorBackendConfig,
 };
 use std::fs;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tempfile::tempdir;
 
 #[derive(Debug)]
@@ -15,6 +16,30 @@ struct MockEmbedder {
 
 impl Embedder for MockEmbedder {
     fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        Ok(texts
+            .iter()
+            .map(|text| {
+                let mut vector = vec![0.0; self.dimensions];
+                vector[0] = text.len() as f32;
+                vector
+            })
+            .collect())
+    }
+
+    fn dimensions(&self) -> usize {
+        self.dimensions
+    }
+}
+
+#[derive(Debug)]
+struct RecordingEmbedder {
+    dimensions: usize,
+    batch_sizes: Arc<Mutex<Vec<usize>>>,
+}
+
+impl Embedder for RecordingEmbedder {
+    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        self.batch_sizes.lock().unwrap().push(texts.len());
         Ok(texts
             .iter()
             .map(|text| {
@@ -128,6 +153,93 @@ fn full_index_handles_more_files_than_old_parser_channel_bound() {
     let result = pipeline.full_index().unwrap();
     assert_eq!(result.indexed, 80);
     assert_eq!(result.symbols, 80);
+}
+
+#[test]
+fn full_index_streams_large_inputs_in_bounded_embedding_batches() {
+    let dir = tempdir().unwrap();
+    for index in 0..80 {
+        fs::write(
+            dir.path().join(format!("module_{index}.ts")),
+            format!("function symbol_{index}() {{\n  return {index};\n}}\n"),
+        )
+        .unwrap();
+    }
+    let mut config = LoomConfig::default_for_target(dir.path());
+    config.embedding_dimensions = 3;
+    config.enable_git_analysis = false;
+    let db = Arc::new(LoomDb::open(config.clone()).unwrap());
+    let batch_sizes = Arc::new(Mutex::new(Vec::new()));
+    let pipeline = IndexPipeline::new(
+        config,
+        db,
+        Arc::new(RecordingEmbedder {
+            dimensions: 3,
+            batch_sizes: Arc::clone(&batch_sizes),
+        }),
+    );
+
+    let result = pipeline.full_index().unwrap();
+    let batch_sizes = batch_sizes.lock().unwrap();
+
+    assert_eq!(result.indexed, 80);
+    assert_eq!(result.symbols, 80);
+    assert!(batch_sizes.len() >= 3);
+    assert!(batch_sizes.iter().all(|size| *size <= 32));
+}
+
+#[test]
+fn full_index_resolves_receiver_method_calls_by_callee_name_for_impact() {
+    let dir = tempdir().unwrap();
+    fs::write(
+        dir.path().join("a.ts"),
+        "export class A {\n  getFont() {\n    return 'mono';\n  }\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("b.ts"),
+        "import { A } from './a';\nexport class B {\n  constructor(private a: A) {}\n  doWork() {\n    return this.a.getFont();\n  }\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("c.ts"),
+        "import { A } from './a';\nexport class C {\n  render(a: A) {\n    return a.getFont();\n  }\n}\n",
+    )
+    .unwrap();
+
+    let mut config = LoomConfig::default_for_target(dir.path());
+    config.embedding_dimensions = 3;
+    config.enable_git_analysis = false;
+    let db = Arc::new(LoomDb::open(config.clone()).unwrap());
+    let pipeline = IndexPipeline::new(
+        config.clone(),
+        Arc::clone(&db),
+        Arc::new(MockEmbedder { dimensions: 3 }),
+    );
+    let result = pipeline.full_index().unwrap();
+
+    assert_eq!(result.errors, 0);
+    let graph = Arc::new(SymbolGraph::build_from_db(&db).unwrap());
+    let engine = SearchEngine::new(
+        Arc::clone(&db),
+        Arc::new(MockEmbedder { dimensions: 3 }),
+        Some(graph),
+        config,
+    );
+
+    let impact = engine.impact("getFont", None, Some("method")).unwrap();
+    let impacted = impact
+        .results
+        .iter()
+        .map(|hit| hit.symbol.name.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(impacted.contains(&"B.doWork"), "{impacted:?}");
+    assert!(impacted.contains(&"C.render"), "{impacted:?}");
+    assert!(impact.results.iter().any(|hit| hit
+        .provenance
+        .iter()
+        .any(|item| item.relationship == "calls")));
 }
 
 #[test]

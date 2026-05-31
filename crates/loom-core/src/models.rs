@@ -1,3 +1,4 @@
+use serde::ser::{SerializeStruct, Serializer};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -271,7 +272,7 @@ pub struct SignalScores {
     pub total: f64,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SymbolHit {
     pub handle: String,
     pub file_handle: String,
@@ -286,8 +287,35 @@ pub struct SymbolHit {
     pub score: f64,
     pub signal_scores: SignalScores,
     pub reason_codes: Vec<String>,
+    pub graph_role: Option<String>,
     pub lexical_evidence: Option<LexicalEvidence>,
     pub coupled: Vec<CoupledHit>,
+}
+
+impl Serialize for SymbolHit {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer
+            .serialize_struct("SymbolHit", 12 + usize::from(self.graph_role.is_some()))?;
+        state.serialize_field("handle", &self.handle)?;
+        state.serialize_field("file_handle", &self.file_handle)?;
+        state.serialize_field("rank", &self.rank)?;
+        state.serialize_field("name", &self.name)?;
+        state.serialize_field("kind", &self.kind)?;
+        state.serialize_field("language", &self.language)?;
+        state.serialize_field("anchor", &self.anchor)?;
+        state.serialize_field("summary", &self.summary)?;
+        state.serialize_field("score", &self.score)?;
+        state.serialize_field("reason_codes", &self.reason_codes)?;
+        if self.graph_role.is_some() {
+            state.serialize_field("graph_role", &self.graph_role)?;
+        }
+        state.serialize_field("lexical_evidence", &self.lexical_evidence)?;
+        state.serialize_field("coupled", &self.coupled)?;
+        state.end()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -335,6 +363,8 @@ pub struct SearchResponse {
     pub contract: String,
     pub version: u32,
     pub index_revision: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_status: Option<String>,
     pub limit: usize,
     pub truncated: bool,
     pub inspect_required: bool,
@@ -346,7 +376,7 @@ pub struct SearchResponse {
     pub beyond_grep: Vec<SymbolHit>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SymbolListResponse {
     pub contract: String,
     pub version: u32,
@@ -361,6 +391,59 @@ pub struct SymbolListResponse {
     pub continuation: Option<Continuation>,
     pub next_tool_suggestions: Vec<NextToolSuggestion>,
     pub results: Vec<SymbolHit>,
+}
+
+impl Serialize for SymbolListResponse {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("SymbolListResponse", 7)?;
+        state.serialize_field("contract", &self.contract)?;
+        state.serialize_field("version", &self.version)?;
+        state.serialize_field("index_revision", &self.index_revision)?;
+        state.serialize_field("truncated", &self.truncated)?;
+        state.serialize_field("query", &self.query)?;
+        state.serialize_field("file_prefix", &self.file_prefix)?;
+        state.serialize_field("results", &CompactSymbolHits(&self.results))?;
+        state.end()
+    }
+}
+
+struct CompactSymbolHits<'a>(&'a [SymbolHit]);
+
+impl Serialize for CompactSymbolHits<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use serde::ser::SerializeSeq;
+
+        let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
+        for hit in self.0 {
+            seq.serialize_element(&CompactSymbolHit(hit))?;
+        }
+        seq.end()
+    }
+}
+
+struct CompactSymbolHit<'a>(&'a SymbolHit);
+
+impl Serialize for CompactSymbolHit<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let hit = self.0;
+        let mut state = serializer.serialize_struct("SymbolHit", 6)?;
+        state.serialize_field("handle", &hit.handle)?;
+        state.serialize_field("name", &hit.name)?;
+        state.serialize_field("kind", &hit.kind)?;
+        state.serialize_field("file", &hit.anchor.file)?;
+        state.serialize_field("line", &hit.anchor.line)?;
+        state.serialize_field("end_line", &hit.anchor.end_line)?;
+        state.end()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -460,6 +543,13 @@ pub struct EvidenceCoverageItem {
     pub detail: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceSubQuestion {
+    pub label: String,
+    pub query: String,
+    pub symbols: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EvidencePackResponse {
     pub contract: String,
@@ -470,6 +560,7 @@ pub struct EvidencePackResponse {
     pub inspect_required: bool,
     pub budget: ResponseBudget,
     pub query: String,
+    pub sub_questions: Vec<EvidenceSubQuestion>,
     pub exact_hits: Vec<SymbolHit>,
     pub beyond_grep: Vec<SymbolHit>,
     pub behavior_facts: Vec<EvidenceFactHit>,

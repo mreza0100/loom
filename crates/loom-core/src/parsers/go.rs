@@ -160,7 +160,9 @@ fn handle_type_declaration(
             continue;
         };
         let name = text(source, name_node);
-        let kind = if descendant_of_kind(spec, &["struct_type", "interface_type"]).is_some() {
+        let kind = if descendant_of_kind(spec, &["interface_type"]).is_some() {
+            "interface"
+        } else if descendant_of_kind(spec, &["struct_type"]).is_some() {
             "class"
         } else {
             "variable"
